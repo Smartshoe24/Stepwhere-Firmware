@@ -1,0 +1,26 @@
+# Arduino / build output
+build/
+*.elf
+*.map
+*.hex
+*.bin
+
+# OTA output
+dist/
+
+# Signing keys: NEVER commit private keys
+keys/
+*.pem
+
+# Host test binaries
+tests/host/*.out
+
+# Editors / OS
+.DS_Store
+__MACOSX/
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+.venv/
