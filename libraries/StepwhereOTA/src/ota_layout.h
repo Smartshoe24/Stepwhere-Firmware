@@ -24,6 +24,9 @@ extern "C" {
 #define MCU_FLASH_SIZE        (128UL * 1024UL)
 #define MCU_FLASH_PAGE_SIZE   2048UL
 
+#define MCU_RAM_BASE          0x20000000UL
+#define MCU_RAM_SIZE          (36UL * 1024UL)
+
 #define BOOTLOADER_ADDR       MCU_FLASH_BASE
 #define BOOTLOADER_SIZE       (16UL * 1024UL)
 
@@ -110,6 +113,17 @@ typedef enum {
 } ota_state_t;
 
 #define OTA_MAX_TRIAL_BOOTS   3u
+
+/* ota_boot_meta_t.last_result: outcome of the last update, for reporting. */
+typedef enum {
+    OTA_RES_NONE           = 0,
+    OTA_RES_INSTALLED      = 1,  /* new image installed, now in TRIAL          */
+    OTA_RES_CONFIRMED      = 2,  /* new image confirmed by the app             */
+    OTA_RES_BAD_IMAGE      = 3,  /* download slot failed verification          */
+    OTA_RES_INSTALL_FAILED = 4,  /* internal flash erase/program/verify failed */
+    OTA_RES_ROLLED_BACK    = 5,  /* previous image restored                    */
+    OTA_RES_NO_BACKUP      = 6   /* rollback needed but no valid backup found  */
+} ota_result_t;
 
 typedef struct {
     uint32_t magic;             /* OTA_META_MAGIC                           */

@@ -9,6 +9,7 @@ Commands
   pack    Wrap an application .bin into a .ota image (+ manifest.json)
   verify  Check a .ota image (header, CRC, SHA-256, optional signature)
   info    Print the header of a .ota image
+  merge   Combine bootloader + app into one .hex for STM32CubeProgrammer
 
 Examples
   python tools/ota_tool.py keygen --out keys/
@@ -256,6 +257,48 @@ def manifest_for(image: bytes, hdr: Header, url: str | None) -> dict:
 
 # ---- CLI ---------------------------------------------------------------------
 
+BOOTLOADER_ADDR = 0x08000000
+BOOTLOADER_SIZE = 16 * 1024
+
+
+def intel_hex(regions: list[tuple[int, bytes]]) -> str:
+    """Intel HEX text for (address, data) regions, 16 bytes per record."""
+    lines = []
+
+    def rec(rtype: int, addr16: int, data: bytes) -> None:
+        body = bytes([len(data), (addr16 >> 8) & 0xFF, addr16 & 0xFF, rtype]) + data
+        lines.append(":" + body.hex().upper() + f"{(-sum(body)) & 0xFF:02X}")
+
+    upper = None
+    for base, data in sorted(regions):
+        for off in range(0, len(data), 16):
+            addr = base + off
+            if addr >> 16 != upper:
+                upper = addr >> 16
+                rec(0x04, 0, upper.to_bytes(2, "big"))
+            rec(0x00, addr & 0xFFFF, data[off:off + 16])
+    rec(0x01, 0, b"")
+    return "\n".join(lines) + "\n"
+
+
+def merge_images(boot: bytes, app: bytes) -> str:
+    if len(boot) > BOOTLOADER_SIZE:
+        raise OtaError(f"bootloader is {len(boot)} bytes, only {BOOTLOADER_SIZE} fit")
+    sp, reset = struct.unpack_from("<II", boot, 0)
+    if not (BOOTLOADER_ADDR <= (reset & ~1) < BOOTLOADER_ADDR + BOOTLOADER_SIZE):
+        raise OtaError("first file does not look like the bootloader (reset vector outside 0x08000000..0x08004000)")
+    check_app_binary(app)
+    return intel_hex([(BOOTLOADER_ADDR, boot), (APP_ADDR, app)])
+
+
+def cmd_merge(args) -> None:
+    text = merge_images(read_bytes(args.bootloader), read_bytes(args.app))
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    with open(args.out, "w") as f:
+        f.write(text)
+    print(f"wrote {args.out}: bootloader @ 0x{BOOTLOADER_ADDR:08X} + app @ 0x{APP_ADDR:08X}")
+
+
 def cmd_keygen(args) -> None:
     _, serialization, ec, _ = _crypto()
     os.makedirs(args.out, exist_ok=True)
@@ -350,6 +393,12 @@ def main(argv=None) -> int:
     v.add_argument("--pubkey", help="PEM public key; checks the signature")
     v.add_argument("--require-signature", action="store_true")
     v.set_defaults(func=cmd_verify)
+
+    mg = sub.add_parser("merge", help="combine bootloader.bin + app.bin into one .hex for factory flashing")
+    mg.add_argument("--bootloader", required=True, help="bootloader .bin (0x08000000)")
+    mg.add_argument("--app", required=True, help="application .bin linked at 0x08004000")
+    mg.add_argument("--out", required=True, help="output .hex")
+    mg.set_defaults(func=cmd_merge)
 
     i = sub.add_parser("info", help="print a .ota header")
     i.add_argument("image")

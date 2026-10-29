@@ -139,6 +139,33 @@ class ImageTests(unittest.TestCase):
             self.assertEqual(t.main(["pack", "--bin", binp, "--version", "1.0",
                                      "--out", os.path.join(d, "x.ota")]), 1)
 
+    def test_merge_hex_roundtrip(self):
+        boot = struct.pack("<II", 0x20009000, 0x080000D1) + bytes(range(200)) * 30
+        app = fake_app()
+        text = t.merge_images(boot, app)
+        mem, upper = {}, 0
+        for line in text.splitlines():
+            raw = bytes.fromhex(line[1:])
+            self.assertEqual(sum(raw) & 0xFF, 0)            # record checksum
+            n, addr, rtype, data = raw[0], (raw[1] << 8) | raw[2], raw[3], raw[4:-1]
+            self.assertEqual(len(data), n)
+            if rtype == 4:
+                upper = int.from_bytes(data, "big") << 16
+            elif rtype == 0:
+                for i, b in enumerate(data):
+                    mem[upper + addr + i] = b
+        self.assertTrue(text.strip().endswith(":00000001FF"))
+        self.assertEqual(bytes(mem[0x08000000 + i] for i in range(len(boot))), boot)
+        self.assertEqual(bytes(mem[0x08004000 + i] for i in range(len(app))), app)
+        self.assertEqual(len(mem), len(boot) + len(app))
+
+    def test_merge_rejects_swapped_files(self):
+        boot = struct.pack("<II", 0x20009000, 0x080000D1) + bytes(100)
+        with self.assertRaises(t.OtaError):
+            t.merge_images(fake_app(), fake_app())
+        with self.assertRaises(t.OtaError):
+            t.merge_images(boot, fake_app(reset=0x080001C1))
+
     def test_c_header_has_64_byte_key(self):
         text = t.read_bytes(os.path.join(self.tmp.name, "ota_public_key.h")).decode()
         self.assertEqual(text.count("0x"), 64)

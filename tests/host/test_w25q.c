@@ -1,14 +1,7 @@
 /*
  * test_w25q.c - Host unit tests for the w25q driver.
  *
- * Runs the real driver code against a simulated W25Q128 that follows the
- * datasheet rules the driver relies on:
- *   - program/erase need WEL, and WEL clears after each one
- *   - only Read Status (05h) is accepted while BUSY
- *   - page program wraps inside its 256-byte page
- *   - programming can only clear bits (AND with old contents)
- *   - in deep power-down only Release (ABh) is accepted
- * Any rule the driver breaks is counted as a "violation".
+ * Runs the real driver code against the simulated W25Q128 in fake_w25q.c.
  *
  * Build and run:  tests/host/run_tests.sh
  */
@@ -20,186 +13,9 @@
 
 #include "ota_layout.h"
 #include "w25q.h"
+#include "fake_w25q.h"
 
-/* ---------------------------- simulated chip ---------------------------- */
-
-typedef struct {
-    uint8_t *mem;
-    uint16_t jedec_dev;        /* device ID to report                     */
-    int      busy_polls;       /* SR reads left before BUSY clears        */
-    int      stuck_busy;       /* never leave BUSY                        */
-    int      write_protected;  /* 06h does not set WEL                    */
-    int      wel, pd, reset_en;
-    /* current /CS frame */
-    int      selected;
-    size_t   pos;
-    uint8_t  cmd;
-    uint32_t addr;
-    uint8_t  page[256];
-    size_t   page_len;
-    /* stats */
-    int      violations;
-    int      n_sector_erase, n_block_erase, n_program, n_reset;
-} fake_t;
-
-static fake_t F;
-static uint32_t fake_ms;
-
-static void fake_reset_state(void)
-{
-    F.wel = 0;
-    F.reset_en = 0;
-}
-
-static uint8_t fake_byte(uint8_t in)
-{
-    size_t p = F.pos++;
-    if (p == 0) {
-        F.cmd = in;
-        F.addr = 0;
-        F.page_len = 0;
-        if (F.pd && in != 0xAB) {
-            F.violations++;          /* command sent while powered down */
-        }
-        /* Command sent while busy. ABh is exempt: init sends it blindly in
-         * case the chip is powered down, and a busy chip just ignores it. */
-        if ((F.busy_polls > 0 || F.stuck_busy) && in != 0x05 && in != 0xAB) {
-            F.violations++;
-        }
-        return 0xFF;
-    }
-    if (F.pd) {
-        return 0xFF;                 /* DO is high-Z in power-down */
-    }
-    switch (F.cmd) {
-    case 0x05: {
-        uint8_t sr = (uint8_t)(F.wel ? 0x02 : 0x00);
-        if (F.stuck_busy) {
-            sr |= 0x01;
-        } else if (F.busy_polls > 0) {
-            sr |= 0x01;
-            F.busy_polls--;
-        }
-        return sr;
-    }
-    case 0x9F: {
-        const uint8_t id[3] = { 0xEF, (uint8_t)(F.jedec_dev >> 8), (uint8_t)F.jedec_dev };
-        return p <= 3 ? id[p - 1] : 0xFF;
-    }
-    case 0x4B:
-        return p >= 5 ? (uint8_t)(0x10 + (p - 5)) : 0xFF;
-    case 0x03:
-    case 0x02:
-    case 0x20:
-    case 0xD8:
-        if (p <= 3) {
-            F.addr = (F.addr << 8) | in;
-            return 0xFF;
-        }
-        if (F.cmd == 0x03) {
-            return F.mem[(F.addr + (uint32_t)(p - 4)) & 0xFFFFFFu];
-        }
-        if (F.cmd == 0x02) {
-            if (F.page_len < sizeof F.page) {
-                F.page[F.page_len] = in;
-            }
-            F.page_len++;
-        }
-        return 0xFF;
-    default:
-        return 0xFF;
-    }
-}
-
-static void fake_end_frame(void)
-{
-    uint8_t cmd = F.cmd;
-    int was_busy = F.busy_polls > 0 || F.stuck_busy;
-
-    if (F.pos == 0) return;
-    if (F.pd) {
-        if (cmd == 0xAB) F.pd = 0;
-        return;
-    }
-    if (was_busy && cmd != 0x05) {
-        return;                      /* ignored by the chip */
-    }
-    if (cmd != 0x99) {
-        F.reset_en = (cmd == 0x66);
-    }
-    switch (cmd) {
-    case 0x06:
-        if (!F.write_protected) F.wel = 1;
-        break;
-    case 0x02:
-        if (!F.wel) { F.violations++; break; }
-        if (F.page_len > 256) { F.violations++; }   /* driver must not overflow a page */
-        for (size_t i = 0; i < F.page_len && i < 256; i++) {
-            uint32_t a = (F.addr & 0xFFFF00u) | ((F.addr + (uint32_t)i) & 0xFFu);
-            F.mem[a] &= F.page[i];
-        }
-        F.wel = 0;
-        F.busy_polls = 2;
-        F.n_program++;
-        break;
-    case 0x20:
-    case 0xD8: {
-        uint32_t size = cmd == 0x20 ? 4096u : 65536u;
-        if (!F.wel) { F.violations++; break; }
-        memset(F.mem + (F.addr & ~(size - 1u)), 0xFF, size);
-        F.wel = 0;
-        F.busy_polls = cmd == 0x20 ? 5 : 20;
-        if (cmd == 0x20) F.n_sector_erase++; else F.n_block_erase++;
-        break;
-    }
-    case 0xB9:
-        F.pd = 1;
-        break;
-    case 0x99:
-        if (F.reset_en) { fake_reset_state(); F.n_reset++; }
-        break;
-    default:
-        break;
-    }
-}
-
-static void bus_select(void *ctx, bool active)
-{
-    (void)ctx;
-    if (active) {
-        assert(!F.selected && "select while already selected");
-        F.selected = 1;
-        F.pos = 0;
-    } else {
-        if (F.selected) fake_end_frame();
-        F.selected = 0;
-        F.pos = 0;
-    }
-}
-
-static void bus_transfer(void *ctx, const uint8_t *tx, uint8_t *rx, size_t len)
-{
-    (void)ctx;
-    assert(F.selected && "transfer without /CS");
-    for (size_t i = 0; i < len; i++) {
-        uint8_t out = fake_byte(tx ? tx[i] : 0xFF);
-        if (rx) rx[i] = out;
-    }
-}
-
-static uint32_t bus_millis(void *ctx) { (void)ctx; return fake_ms++; }
-static void bus_delay_us(void *ctx, uint32_t us) { (void)ctx; (void)us; }
-
-static const w25q_bus_t BUS = { NULL, bus_select, bus_transfer, bus_millis, bus_delay_us };
-
-static void fake_new_chip(void)
-{
-    uint8_t *mem = F.mem;
-    memset(&F, 0, sizeof F);
-    F.mem = mem;
-    memset(F.mem, 0xFF, W25Q_CAPACITY);
-    F.jedec_dev = W25Q_ID_128_IQ;
-}
+#define BUS FAKE_BUS
 
 /* --------------------------------- tests -------------------------------- */
 
@@ -364,8 +180,7 @@ static void test_layout(void)
 
 int main(void)
 {
-    F.mem = malloc(W25Q_CAPACITY);
-    if (!F.mem) return 2;
+    fake_new_chip();
 
     test_layout();
     test_init_ok();
@@ -378,6 +193,5 @@ int main(void)
     test_write_protected();
 
     printf("%d checks, %d failed\n", g_checks, g_failed);
-    free(F.mem);
     return g_failed ? 1 : 0;
 }

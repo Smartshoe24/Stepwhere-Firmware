@@ -4,7 +4,9 @@ Firmware for the Stepwhere GSM PCB (STM32G070CBT6 + Neoway N706B + W25Q128).
 
 ```
 stepwhere/              main application sketch (Arduino, STM32duino core 2.x)
-libraries/StepwhereOTA/ OTA building blocks: W25Q128 driver, OTA layout
+bootloader/             OTA bootloader (plain C, make), first 16 KB of flash
+libraries/StepwhereOTA/ OTA building blocks: W25Q128 driver, OTA layout, metadata
+prebuilt/               test builds for bench testing (not release firmware)
 tests/flash_selftest/   sketch that checks the external flash on a board
 tests/host/             unit tests that run on a PC (no hardware needed)
 tools/ota_tool.py       packs and signs firmware images for OTA
@@ -34,6 +36,18 @@ arduino-cli compile --fqbn $FQBN --libraries libraries --output-dir build/selfte
 # Application linked at 0x08004000 (for use with the OTA bootloader, not yet available)
 arduino-cli compile --fqbn $FQBN --build-property build.flash_offset=0x4000 --output-dir build/app stepwhere
 ```
+
+## Bootloader
+
+```sh
+make -C bootloader CROSS=/path/to/arm-none-eabi-
+# combine with an app built at 0x08004000 into one file for STM32CubeProgrammer
+python tools/ota_tool.py merge --bootloader bootloader/build/bootloader.bin \
+       --app build/app/stepwhere.ino.bin --out build/stepwhere_with_bootloader.hex
+```
+
+Flashing an app on its own: a `.bin` must go to **0x08004000**. Writing it to
+0x08000000 overwrites the bootloader.
 
 ## Flash self-test
 

@@ -109,6 +109,36 @@ until the new app is confirmed.
 * Core 3.0.0 changed `HardwareSerial(rx, tx)`; the current firmware only
   builds on the 2.x core.
 
+## Bootloader (`bootloader/`, v0.1.0)
+
+Plain C, register level, no HAL. Build: `make -C bootloader` (needs
+`arm-none-eabi-gcc`). Current size about 8 KB of the 16 KB area.
+
+* `src/boot_core.c`: state machine, hardware independent, tested on the PC
+  (`tests/host/test_boot.c`) with simulated flash and power cuts at every
+  erase/program step of an update and a rollback.
+* `src/main.c`: clocks (reset-default HSI 16 MHz), SysTick, USART1 log on PB6,
+  SPI1 W25Q128 access, internal flash erase/program, jump to the app.
+* Logs every decision on the debug UART with a `[BOOT]` prefix.
+* Finds the W25Q128 on the always-on rail first, then tries with `LDO_EN` on.
+  If the flash does not answer at all, OTA is skipped and the app starts
+  (after about 3 s of retries).
+* Before jumping: flash put in power-down, SysTick and NVIC cleared, SPI1 and
+  USART1 reset, instruction cache flushed, `SCB->VTOR = 0x08004000`.
+
+Not in v0.1.0 yet:
+
+* ECDSA signature check (images are accepted on header CRC + SHA-256).
+* Watchdog. Without it, an app that hangs (instead of resetting) during a
+  trial is not rolled back until something resets the board.
+* Battery check before installing. The app must only mark an update PENDING
+  when the battery is high enough.
+
+The app must call `ota_meta_confirm()` after an OTA install once its own
+self-test passes, otherwise the bootloader rolls back after
+`OTA_MAX_TRIAL_BOOTS` (3) boots. Firmware flashed over UART does not need this:
+with no metadata the bootloader just starts it.
+
 ## Signing keys
 
 * `python tools/ota_tool.py keygen --out keys/` creates the key pair once.
@@ -123,5 +153,5 @@ until the new app is confirmed.
   LDO_EN-switched one (the self-test reports it). If it is switched, the
   bootloader must enable LDO_EN before touching the flash.
 * Confirm board selection: G070CBTx (BOM) vs G071CB (comment in stepwhere.ino).
-* Bootloader (LL drivers, SHA-256, ECDSA verify, state machine).
+* Bootloader: ECDSA verify, watchdog, battery check.
 * App-side OTA client for the N706B, GitHub Actions workflow, hosting.
