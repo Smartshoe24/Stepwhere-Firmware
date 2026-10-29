@@ -10,11 +10,14 @@
 
 #include "board.h"
 #include "boot_core.h"
+#include "ota_public_key.h"
 #include "ota_layout.h"
 #include "w25q.h"
 
 /* ------------------------------------------------------------------------ */
 /* Time                                                                     */
+
+static void log_line(void *ctx, const char *line);
 
 static volatile uint32_t s_ms;
 
@@ -37,6 +40,27 @@ static void delay_us(uint32_t us)
     volatile uint32_t n = us * (SYSCLK_HZ / 4000000u) + 1u;
     while (n--) { }
 }
+
+/* ------------------------------------------------------------------------ */
+/* Independent watchdog: LSI ~32 kHz / 256 = 125 Hz, reload 2500 -> ~20 s.  */
+
+#define IWDG_RELOAD 2500u
+
+static void wdg_kick(void) { IWDG->KR = 0xAAAAu; }
+
+static void port_wdg_start(void *ctx)
+{
+    (void)ctx;
+    IWDG->KR = 0xCCCCu;            /* start (also enables the LSI) */
+    IWDG->KR = 0x5555u;            /* unlock PR/RLR */
+    IWDG->PR = 6u;                 /* /256 */
+    IWDG->RLR = IWDG_RELOAD;
+    while (IWDG->SR != 0u) { }
+    wdg_kick();
+    log_line(NULL, "[BOOT] watchdog on (~20 s)");
+}
+
+static void port_wdg_kick(void *ctx) { (void)ctx; wdg_kick(); }
 
 /* ------------------------------------------------------------------------ */
 /* GPIO                                                                     */
@@ -133,7 +157,8 @@ static void bus_transfer(void *ctx, const uint8_t *tx, uint8_t *rx, size_t len)
     }
 }
 
-static uint32_t bus_millis(void *ctx) { (void)ctx; return ms_now(); }
+/* Called in every W25Q busy-wait loop, so long erases also feed the watchdog. */
+static uint32_t bus_millis(void *ctx) { (void)ctx; wdg_kick(); return ms_now(); }
 static void bus_delay_us(void *ctx, uint32_t us) { (void)ctx; delay_us(us); }
 
 static const w25q_bus_t s_bus = { NULL, bus_select, bus_transfer, bus_millis, bus_delay_us };
@@ -213,6 +238,7 @@ static int port_erase_page(void *ctx, uint32_t addr)
         return -1;
     }
     uint32_t page = (addr - MCU_FLASH_BASE) / MCU_FLASH_PAGE_SIZE;
+    wdg_kick();
     mcu_flash_unlock();
     FLASH->SR = FLASH_SR_ERR_MASK | FLASH_SR_EOP;
     FLASH->CR = (FLASH->CR & ~(FLASH_CR_PNB | FLASH_CR_PG)) | (page << FLASH_CR_PNB_Pos) | FLASH_CR_PER;
@@ -317,11 +343,24 @@ int main(void)
         .erase_page = port_erase_page,
         .program = port_program,
         .log = log_line,
+        .pubkey = OTA_PUBLIC_KEY,
+        .wdg_start = port_wdg_start,
+        .wdg_kick = port_wdg_kick,
+        .millis = bus_millis,
     };
 
-    if (boot_run(&port) == BOOT_JUMP) {
+#if OTA_PUBLIC_KEY_IS_DEV
+    log_line(NULL, "[BOOT] WARNING: development signing key, not for products");
+#endif
+
+    boot_result_t r = boot_run(&port);
+    if (r == BOOT_JUMP) {
         log_line(NULL, "[BOOT] starting application at 0x08004000");
         jump_to_app();
+    }
+    if (r == BOOT_RESET) {
+        uart_flush();
+        NVIC_SystemReset();
     }
 
     log_line(NULL, "[BOOT] no valid application. Flash the firmware .hex with STM32CubeProgrammer.");

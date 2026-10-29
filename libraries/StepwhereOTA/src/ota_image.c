@@ -4,6 +4,7 @@
 
 #include "ota_crc32.h"
 #include "ota_sha256.h"
+#include "ota_uecc.h"
 
 #define HDR_CRC_LEN (OTA_HDR_SIZE - 4u)   /* CRC covers bytes [0, 252) */
 
@@ -40,9 +41,25 @@ ota_img_status_t ota_image_check_header(const ota_image_header_t *hdr)
     return OTA_IMG_OK;
 }
 
+ota_img_status_t ota_image_check_signature(const ota_image_header_t *hdr, const uint8_t pubkey[64])
+{
+    uint8_t digest[OTA_SHA256_LEN];
+    if ((hdr->flags & OTA_FLAG_SIGNED) == 0u) {
+        return OTA_IMG_ERR_UNSIGNED;
+    }
+    /* The signed part of the header includes payload_sha256, so this
+     * signature covers the whole image. */
+    ota_sha256(hdr, OTA_HDR_SIGNED_LEN, digest);
+    if (!uECC_verify(pubkey, digest, sizeof digest, hdr->signature, uECC_secp256r1())) {
+        return OTA_IMG_ERR_SIGNATURE;
+    }
+    return OTA_IMG_OK;
+}
+
 ota_img_status_t ota_image_check_slot(w25q_t *dev, uint32_t slot_addr,
                                       ota_image_header_t *hdr_out,
-                                      uint8_t *buf, size_t buf_len)
+                                      uint8_t *buf, size_t buf_len,
+                                      const uint8_t *pubkey)
 {
     ota_image_header_t hdr;
     ota_sha256_t sha;
@@ -59,6 +76,12 @@ ota_img_status_t ota_image_check_slot(w25q_t *dev, uint32_t slot_addr,
     st = ota_image_check_header(&hdr);
     if (st != OTA_IMG_OK) {
         return st;
+    }
+    if (pubkey) {
+        st = ota_image_check_signature(&hdr, pubkey);
+        if (st != OTA_IMG_OK) {
+            return st;
+        }
     }
 
     ota_sha256_init(&sha);
@@ -103,6 +126,8 @@ const char *ota_img_status_str(ota_img_status_t st)
     case OTA_IMG_ERR_SIZE:    return "bad size";
     case OTA_IMG_ERR_VECTORS: return "not linked at 0x08004000";
     case OTA_IMG_ERR_HASH:    return "SHA-256 mismatch";
+    case OTA_IMG_ERR_UNSIGNED:  return "not signed";
+    case OTA_IMG_ERR_SIGNATURE: return "bad signature";
     default:                  return "unknown";
     }
 }

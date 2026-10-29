@@ -8,6 +8,8 @@
  *   u   receive a .ota file by XMODEM into the download slot, check it,
  *       and mark it PENDING (installed by the bootloader on the next reset)
  *   r   reset
+ *   f   mark whatever is in the download slot PENDING without checking it
+ *       (tests that the BOOTLOADER rejects bad files on its own)
  *   e   erase the boot metadata (back to "first boot")
  *   h   help
  *
@@ -15,12 +17,20 @@
  *   TEST_APP_VERSION_MAJOR / _MINOR / _PATCH   version printed at start
  *   TEST_APP_NO_CONFIRM=1   never confirm, and reset after 10 s. Simulates a
  *                           broken update: the bootloader must roll back.
+ *   TEST_APP_HANG=1         hang right after start without feeding the
+ *                           watchdog: the watchdog must reset it, then the
+ *                           bootloader must roll back.
+ *
+ * Watchdog: during a trial boot the bootloader leaves the IWDG running
+ * (~20 s). This app feeds it, and after confirming it resets once so it
+ * runs without the watchdog from then on.
  */
 #include <HardwareSerial.h>
 #include <W25QArduino.h>
 #include <ota_image.h>
 #include <ota_layout.h>
 #include <ota_meta.h>
+#include <ota_public_key.h>
 #include <w25q.h>
 
 #ifndef TEST_APP_VERSION_MAJOR
@@ -35,6 +45,12 @@
 #ifndef TEST_APP_NO_CONFIRM
 #define TEST_APP_NO_CONFIRM 0
 #endif
+#ifndef TEST_APP_HANG
+#define TEST_APP_HANG 0
+#endif
+
+/* Feed the watchdog. Harmless when it is not running. */
+static inline void wdg_kick() { IWDG->KR = 0xAAAA; }
 
 #define APP_VERSION OTA_VERSION(TEST_APP_VERSION_MAJOR, TEST_APP_VERSION_MINOR, TEST_APP_VERSION_PATCH)
 
@@ -70,10 +86,10 @@ static const char *result_str(uint32_t r)
     }
 }
 
-static void show_slot(const char *name, uint32_t addr)
+static void show_slot(const char *name, uint32_t addr, const uint8_t *key)
 {
     ota_image_header_t h;
-    ota_img_status_t st = ota_image_check_slot(flash.dev(), addr, &h, g_buf, sizeof g_buf);
+    ota_img_status_t st = ota_image_check_slot(flash.dev(), addr, &h, g_buf, sizeof g_buf, key);
     SerialDBG.print("  ");
     SerialDBG.print(name);
     SerialDBG.print(" slot: ");
@@ -112,8 +128,8 @@ static void cmd_info()
         SerialDBG.print("  seq          ");
         SerialDBG.println(m.seq);
     }
-    show_slot("download", EXT_SLOT_DOWNLOAD);
-    show_slot("backup  ", EXT_SLOT_BACKUP);
+    show_slot("download", EXT_SLOT_DOWNLOAD, OTA_PUBLIC_KEY);
+    show_slot("backup  ", EXT_SLOT_BACKUP, NULL);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -131,6 +147,7 @@ static int read_byte(uint32_t timeout_ms)
 {
     uint32_t t0 = millis();
     while ((uint32_t)(millis() - t0) < timeout_ms) {
+        wdg_kick();
         if (SerialDBG.available()) return SerialDBG.read();
     }
     return -1;
@@ -232,7 +249,12 @@ static void cmd_upload()
     SerialDBG.println(" bytes. Checking image...");
 
     ota_image_header_t h;
-    ota_img_status_t st = ota_image_check_slot(flash.dev(), EXT_SLOT_DOWNLOAD, &h, g_buf, sizeof g_buf);
+    uint32_t t0 = millis();
+    ota_img_status_t st = ota_image_check_slot(flash.dev(), EXT_SLOT_DOWNLOAD, &h, g_buf, sizeof g_buf,
+                                               OTA_PUBLIC_KEY);
+    SerialDBG.print("Check took ");
+    SerialDBG.print(millis() - t0);
+    SerialDBG.println(" ms");
     if (st != OTA_IMG_OK) {
         SerialDBG.print("Image REJECTED: ");
         SerialDBG.println(ota_img_status_str(st));
@@ -250,6 +272,15 @@ static void cmd_upload()
     SerialDBG.println("Marked PENDING. Press 'r' (or reset the board) to install.");
 }
 
+static void cmd_force_pending()
+{
+    if (!g_flash_ok) return;
+    ota_image_header_t h;
+    w25q_read(flash.dev(), EXT_SLOT_DOWNLOAD, &h, sizeof h);
+    ota_meta_set_pending(flash.dev(), h.fw_version);
+    SerialDBG.println("Download slot marked PENDING WITHOUT checks (test). Press 'r'.");
+}
+
 static void cmd_erase_meta()
 {
     if (!g_flash_ok) return;
@@ -261,6 +292,7 @@ static void cmd_erase_meta()
 static void help()
 {
     SerialDBG.println("Commands: i = OTA info, u = upload .ota by XMODEM, r = reset, e = erase metadata, h = help");
+    SerialDBG.println("          f = mark download slot PENDING without checks (bootloader test)");
 }
 
 /* ------------------------------------------------------------------------ */
@@ -276,10 +308,17 @@ void setup()
 #if TEST_APP_NO_CONFIRM
     SerialDBG.print("  (NO-CONFIRM build)");
 #endif
+#if TEST_APP_HANG
+    SerialDBG.print("  (HANG build)");
+#endif
     SerialDBG.println();
     SerialDBG.print("  running from 0x");
     SerialDBG.print(SCB->VTOR, HEX);
     SerialDBG.println(" (VTOR)");
+    /* Starting the IWDG forces the LSI clock on; this app uses nothing else
+     * that needs it, so LSI ready means the watchdog is running. */
+    SerialDBG.print("  watchdog: ");
+    SerialDBG.println((RCC->CSR & RCC_CSR_LSIRDY) ? "RUNNING (trial boot)" : "off");
     SerialDBG.println("==============================================");
 
     g_flash_ok = flash.begin() == W25Q_OK;
@@ -287,7 +326,11 @@ void setup()
         SerialDBG.println("external flash NOT found");
     }
 
-#if TEST_APP_NO_CONFIRM
+#if TEST_APP_HANG
+    SerialDBG.println("Hanging now without feeding the watchdog...");
+    SerialDBG.flush();
+    for (;;) { }
+#elif TEST_APP_NO_CONFIRM
     SerialDBG.println("Not confirming this firmware. Resetting in 10 s to simulate a crash.");
 #else
     if (g_flash_ok) {
@@ -295,7 +338,9 @@ void setup()
         if (ota_meta_load(flash.dev(), &m) && m.state == OTA_STATE_TRIAL) {
             /* A real app would run its self-test (GSM, GPS, sensor) first. */
             ota_meta_confirm(flash.dev());
-            SerialDBG.println("New firmware confirmed.");
+            SerialDBG.println("New firmware confirmed. Restarting once to drop the watchdog.");
+            SerialDBG.flush();
+            NVIC_SystemReset();
         }
     }
 #endif
@@ -306,6 +351,7 @@ void setup()
 void loop()
 {
     static uint32_t last_beat;
+    wdg_kick();
     if ((uint32_t)(millis() - last_beat) >= 5000) {
         last_beat = millis();
         SerialDBG.print("[v");
@@ -331,6 +377,7 @@ void loop()
         NVIC_SystemReset();
         break;
     case 'e': case 'E': cmd_erase_meta(); break;
+    case 'f': case 'F': cmd_force_pending(); break;
     case 'h': case 'H': case '?': help(); break;
     default: break;
     }

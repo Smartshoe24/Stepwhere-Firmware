@@ -12,7 +12,7 @@
 
 #include "w25q.h"
 
-#define BOOT_VERSION_STR "0.1.0"
+#define BOOT_VERSION_STR "0.2.0"
 
 typedef struct {
     void *ctx;
@@ -30,11 +30,23 @@ typedef struct {
     int (*program)(void *ctx, uint32_t addr, const uint8_t *data, uint32_t len);
     /* Write one log line (no newline included). May be NULL. */
     void (*log)(void *ctx, const char *line);
+    /* ECDSA P-256 public key (raw X||Y). Images in the download slot must be
+     * signed with the matching private key. NULL disables the check (tests). */
+    const uint8_t *pubkey;
+    /* Independent watchdog. Started only while an update, trial or rollback
+     * is in progress; it cannot be stopped again until the next reset.
+     * May be NULL. */
+    void (*wdg_start)(void *ctx);
+    void (*wdg_kick)(void *ctx);
+    /* Milliseconds, for timing logs. May be NULL. */
+    uint32_t (*millis)(void *ctx);
 } boot_port_t;
 
 typedef enum {
-    BOOT_JUMP = 0,   /* start the application at APP_ADDR      */
-    BOOT_NO_APP      /* nothing bootable, stay in the bootloader */
+    BOOT_JUMP = 0,   /* start the application at APP_ADDR                 */
+    BOOT_NO_APP,     /* nothing bootable, stay in the bootloader          */
+    BOOT_RESET       /* work done, watchdog running but not needed: reset
+                        so the next boot starts the app without it         */
 } boot_result_t;
 
 boot_result_t boot_run(const boot_port_t *p);

@@ -22,6 +22,20 @@
 
 static uint8_t s_buf[MCU_FLASH_PAGE_SIZE];
 static ota_boot_meta_t s_meta;
+static bool s_wdg_on;
+
+static void wdg_kick(const boot_port_t *p)
+{
+    if (s_wdg_on && p->wdg_kick) p->wdg_kick(p->ctx);
+}
+
+static void wdg_start(const boot_port_t *p)
+{
+    if (!s_wdg_on && p->wdg_start) {
+        p->wdg_start(p->ctx);
+        s_wdg_on = true;
+    }
+}
 
 /* ------------------------------------------------------------------------ */
 /* Tiny logger: %s string, %u decimal, %x 0x%08X, %v version a.b.c          */
@@ -161,6 +175,7 @@ static bool install_from(const boot_port_t *p, uint32_t slot, const ota_image_he
     uint32_t addr;
 
     for (addr = APP_ADDR; addr < APP_ADDR + APP_MAX_SIZE; addr += MCU_FLASH_PAGE_SIZE) {
+        wdg_kick(p);
         if (p->erase_page(p->ctx, addr) != 0) {
             blog(p, "erase failed at %x", addr);
             return false;
@@ -169,6 +184,7 @@ static bool install_from(const boot_port_t *p, uint32_t slot, const ota_image_he
     for (uint32_t off = 0; off < hdr->image_size; off += MCU_FLASH_PAGE_SIZE) {
         uint32_t n = hdr->image_size - off;
         if (n > MCU_FLASH_PAGE_SIZE) n = MCU_FLASH_PAGE_SIZE;
+        wdg_kick(p);
         if (w25q_read(p->ext, slot + OTA_HDR_SIZE + off, s_buf, n) != W25Q_OK) {
             blog(p, "read failed at slot offset %u", off);
             return false;
@@ -192,11 +208,17 @@ static bool install_from(const boot_port_t *p, uint32_t slot, const ota_image_he
 }
 
 static ota_img_status_t check_slot(const boot_port_t *p, uint32_t slot, const char *name,
-                                   ota_image_header_t *hdr)
+                                   ota_image_header_t *hdr, const uint8_t *pubkey)
 {
-    ota_img_status_t st = ota_image_check_slot(p->ext, slot, hdr, s_buf, sizeof s_buf);
+    ota_img_status_t st;
+    uint32_t t0 = p->millis ? p->millis(p->ctx) : 0;
+    wdg_kick(p);
+    st = ota_image_check_slot(p->ext, slot, hdr, s_buf, sizeof s_buf, pubkey);
+    wdg_kick(p);
+    uint32_t ms = p->millis ? p->millis(p->ctx) - t0 : 0;
     if (st == OTA_IMG_OK) {
-        blog(p, "%s slot: v%v, %u bytes, ok", name, hdr->fw_version, hdr->image_size);
+        blog(p, "%s slot: v%v, %u bytes, %s ok (%u ms)", name, hdr->fw_version, hdr->image_size,
+             pubkey ? "signature" : "hash", ms);
     } else {
         blog(p, "%s slot: %s", name, ota_img_status_str(st));
     }
@@ -211,7 +233,7 @@ static boot_result_t roll_back(const boot_port_t *p)
     ota_image_header_t hdr;
 
     for (int i = 0; i < 2; i++) {
-        if (check_slot(p, slots[i], names[i], &hdr) != OTA_IMG_OK) continue;
+        if (check_slot(p, slots[i], names[i], &hdr, NULL) != OTA_IMG_OK) continue;
         if (!install_from(p, slots[i], &hdr)) continue;
         s_meta.trial_boots = 0;
         s_meta.pending_version = 0;
@@ -228,7 +250,7 @@ static boot_result_t roll_back(const boot_port_t *p)
 
 /* ------------------------------------------------------------------------ */
 
-boot_result_t boot_run(const boot_port_t *p)
+static boot_result_t run_states(const boot_port_t *p)
 {
     ota_image_header_t hdr;
 
@@ -247,6 +269,9 @@ boot_result_t boot_run(const boot_port_t *p)
     }
 
     for (int step = 0; step < MAX_STEPS; step++) {
+        if (s_meta.state != OTA_STATE_IDLE) {
+            wdg_start(p);
+        }
         switch (s_meta.state) {
         case OTA_STATE_IDLE:
             if (boot_app_valid(p)) {
@@ -257,7 +282,7 @@ boot_result_t boot_run(const boot_port_t *p)
             break;
 
         case OTA_STATE_PENDING:
-            if (check_slot(p, EXT_SLOT_DOWNLOAD, "download", &hdr) != OTA_IMG_OK) {
+            if (check_slot(p, EXT_SLOT_DOWNLOAD, "download", &hdr, p->pubkey) != OTA_IMG_OK) {
                 s_meta.last_result = OTA_RES_BAD_IMAGE;
                 s_meta.pending_version = 0;
                 if (!save_meta(p, OTA_STATE_IDLE)) return boot_app_valid(p) ? BOOT_JUMP : BOOT_NO_APP;
@@ -276,7 +301,7 @@ boot_result_t boot_run(const boot_port_t *p)
             break;
 
         case OTA_STATE_INSTALLING:
-            if (check_slot(p, EXT_SLOT_DOWNLOAD, "download", &hdr) != OTA_IMG_OK ||
+            if (check_slot(p, EXT_SLOT_DOWNLOAD, "download", &hdr, p->pubkey) != OTA_IMG_OK ||
                 !install_from(p, EXT_SLOT_DOWNLOAD, &hdr)) {
                 s_meta.last_result = OTA_RES_INSTALL_FAILED;
                 if (!save_meta(p, OTA_STATE_ROLLING_BACK)) return BOOT_NO_APP;
@@ -310,4 +335,19 @@ boot_result_t boot_run(const boot_port_t *p)
         }
     }
     return boot_app_valid(p) ? BOOT_JUMP : BOOT_NO_APP;
+}
+
+boot_result_t boot_run(const boot_port_t *p)
+{
+    boot_result_t r;
+    s_wdg_on = false;
+    r = run_states(p);
+    /* The watchdog cannot be stopped. A new app in TRIAL must keep feeding
+     * it (and resets after confirming). Any other app should not inherit
+     * it, so reset once and start it from a clean, watchdog-free boot. */
+    if (r == BOOT_JUMP && s_wdg_on && s_meta.state != OTA_STATE_TRIAL) {
+        blog(p, "update work done, restarting");
+        return BOOT_RESET;
+    }
+    return r;
 }

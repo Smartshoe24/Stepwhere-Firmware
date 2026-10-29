@@ -15,7 +15,7 @@ LIB     := ../libraries/StepwhereOTA/src
 BUILD   := build
 
 SRCS := src/startup.c src/main.c src/boot_core.c \
-        $(LIB)/w25q.c $(LIB)/ota_crc32.c $(LIB)/ota_sha256.c $(LIB)/ota_image.c $(LIB)/ota_meta.c
+        $(LIB)/w25q.c $(LIB)/ota_crc32.c $(LIB)/ota_sha256.c $(LIB)/ota_image.c $(LIB)/ota_meta.c $(LIB)/ota_uecc.c
 
 CFLAGS := -mcpu=cortex-m0plus -mthumb -Os -g -std=c11 \
           -Wall -Wextra -Werror \

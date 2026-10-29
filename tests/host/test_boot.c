@@ -20,7 +20,9 @@
 #include "ota_image.h"
 #include "ota_layout.h"
 #include "ota_meta.h"
+#include "ota_public_key.h"
 #include "ota_sha256.h"
+#include "ota_uecc.h"
 #include "w25q.h"
 
 static int g_checks, g_failed;
@@ -71,11 +73,50 @@ static void sim_log(void *ctx, const char *line)
 
 static w25q_t g_dev;
 
-/* One power-on of the device. Returns the boot result. */
+/* Signing keys used by the tests (generated at start). */
+static uint8_t g_priv[32], g_pub[64];        /* the device's trusted key */
+static uint8_t g_other_priv[32], g_other_pub[64];
+static const uint8_t *g_pubkey = g_pub;      /* key given to the bootloader */
+
+static int g_wdg_starts, g_resets;
+static void sim_wdg_start(void *ctx) { (void)ctx; g_wdg_starts++; }
+static void sim_wdg_kick(void *ctx) { (void)ctx; }
+
+static int rng(uint8_t *dest, unsigned size)
+{
+    FILE *f = fopen("/dev/urandom", "rb");
+    size_t n = f ? fread(dest, 1, size, f) : 0;
+    if (f) fclose(f);
+    return n == size;
+}
+
+/* One power-on of the device, following BOOT_RESET restarts (max 3). */
 static boot_result_t do_boot(void)
 {
+    boot_result_t r = BOOT_RESET;
+    for (int i = 0; i < 4 && r == BOOT_RESET; i++) {
+        fake_power_cycle();
+        boot_port_t port = {
+            .app_mem = g_mcu, .erase_page = sim_erase_page, .program = sim_program,
+            .log = sim_log, .pubkey = g_pubkey,
+            .wdg_start = sim_wdg_start, .wdg_kick = sim_wdg_kick,
+        };
+        if (w25q_init(&g_dev, &FAKE_BUS) == W25Q_OK) port.ext = &g_dev;
+        r = boot_run(&port);
+        if (r == BOOT_RESET) g_resets++;
+    }
+    return r;
+}
+
+/* A single boot_run() without following restarts. */
+static boot_result_t boot_once(void)
+{
     fake_power_cycle();
-    boot_port_t port = { NULL, NULL, g_mcu, sim_erase_page, sim_program, sim_log };
+    boot_port_t port = {
+        .app_mem = g_mcu, .erase_page = sim_erase_page, .program = sim_program,
+        .log = sim_log, .pubkey = g_pubkey,
+        .wdg_start = sim_wdg_start, .wdg_kick = sim_wdg_kick,
+    };
     if (w25q_init(&g_dev, &FAKE_BUS) == W25Q_OK) port.ext = &g_dev;
     return boot_run(&port);
 }
@@ -126,6 +167,18 @@ static void make_app(app_t *a, uint32_t size, uint32_t version, uint32_t seed)
     }
 }
 
+static void sign_header(ota_image_header_t *h, const uint8_t *priv)
+{
+    uint8_t digest[32];
+    h->flags |= OTA_FLAG_SIGNED;
+    ota_sha256(h, OTA_HDR_SIGNED_LEN, digest);
+    if (!uECC_sign(priv, digest, sizeof digest, h->signature, uECC_secp256r1())) {
+        printf("uECC_sign failed\n");
+        exit(2);
+    }
+    ota_image_header_seal(h);
+}
+
 static void build_header(ota_image_header_t *h, const app_t *a)
 {
     memset(h, 0, sizeof *h);
@@ -137,7 +190,7 @@ static void build_header(ota_image_header_t *h, const app_t *a)
     h->load_addr = APP_ADDR;
     h->hw_id = OTA_HW_ID_GSM_PCB_R1;
     ota_sha256(a->bytes, a->size, h->payload_sha256);
-    ota_image_header_seal(h);
+    sign_header(h, g_priv);
 }
 
 static void put_image(uint32_t slot, const app_t *a)
@@ -333,7 +386,7 @@ static void test_update_and_confirm(void)
 
     /* Backup slot now holds v1 as a valid image. */
     uint8_t buf[512];
-    CHECK(ota_image_check_slot(&g_dev, EXT_SLOT_BACKUP, &h, buf, sizeof buf) == OTA_IMG_OK);
+    CHECK(ota_image_check_slot(&g_dev, EXT_SLOT_BACKUP, &h, buf, sizeof buf, NULL) == OTA_IMG_OK);
     CHECK(h.fw_version == APP_V1.version && h.image_size == APP_V1.size);
 
     /* App confirms; later boots stay on v2 and write nothing. */
@@ -360,7 +413,7 @@ static void test_wrong_board_rejected(void)
     scenario_update_ready();
     memcpy(&h, F.mem + EXT_SLOT_DOWNLOAD, sizeof h);
     h.hw_id = 0x00020001u;
-    ota_image_header_seal(&h);
+    sign_header(&h, g_priv);           /* validly signed, but for another board */
     memcpy(F.mem + EXT_SLOT_DOWNLOAD, &h, sizeof h);
     CHECK(do_boot() == BOOT_JUMP);
     CHECK(mcu_holds(&APP_V1) && meta().last_result == OTA_RES_BAD_IMAGE);
@@ -483,6 +536,90 @@ static void test_double_power_cut(void)
     printf("  double cuts: %ld combinations tested\n", tested);
 }
 
+
+static void test_unsigned_rejected(void)
+{
+    ota_image_header_t h;
+    scenario_update_ready();
+    memcpy(&h, F.mem + EXT_SLOT_DOWNLOAD, sizeof h);
+    h.flags = 0;
+    memset(h.signature, 0, sizeof h.signature);
+    ota_image_header_seal(&h);
+    memcpy(F.mem + EXT_SLOT_DOWNLOAD, &h, sizeof h);
+    CHECK(do_boot() == BOOT_JUMP);
+    CHECK(mcu_holds(&APP_V1) && meta().last_result == OTA_RES_BAD_IMAGE);
+}
+
+static void test_wrong_key_rejected(void)
+{
+    ota_image_header_t h;
+    scenario_update_ready();
+    memcpy(&h, F.mem + EXT_SLOT_DOWNLOAD, sizeof h);
+    sign_header(&h, g_other_priv);
+    memcpy(F.mem + EXT_SLOT_DOWNLOAD, &h, sizeof h);
+    CHECK(do_boot() == BOOT_JUMP);
+    CHECK(mcu_holds(&APP_V1) && meta().last_result == OTA_RES_BAD_IMAGE);
+}
+
+static void test_tampered_header_rejected(void)
+{
+    /* Attacker changes the version and fixes the CRC, but cannot re-sign. */
+    ota_image_header_t h;
+    scenario_update_ready();
+    memcpy(&h, F.mem + EXT_SLOT_DOWNLOAD, sizeof h);
+    h.fw_version = OTA_VERSION(9, 9, 9);
+    ota_image_header_seal(&h);
+    memcpy(F.mem + EXT_SLOT_DOWNLOAD, &h, sizeof h);
+    CHECK(do_boot() == BOOT_JUMP);
+    CHECK(mcu_holds(&APP_V1) && meta().last_result == OTA_RES_BAD_IMAGE);
+}
+
+static void test_signature_api(void)
+{
+    ota_image_header_t h;
+    build_header(&h, &APP_V2);
+    CHECK(ota_image_check_signature(&h, g_pub) == OTA_IMG_OK);
+    CHECK(ota_image_check_signature(&h, g_other_pub) == OTA_IMG_ERR_SIGNATURE);
+    h.signature[10] ^= 1;
+    CHECK(ota_image_check_signature(&h, g_pub) == OTA_IMG_ERR_SIGNATURE);
+    h.flags = 0;
+    CHECK(ota_image_check_signature(&h, g_pub) == OTA_IMG_ERR_UNSIGNED);
+}
+
+static void test_watchdog_usage(void)
+{
+    /* Normal boot: no watchdog, no restart. */
+    fake_new_chip();
+    install_direct(&APP_V1);
+    set_meta(OTA_STATE_IDLE, &APP_V1, 0);
+    g_wdg_starts = 0;
+    CHECK(boot_once() == BOOT_JUMP && g_wdg_starts == 0);
+
+    /* Install: watchdog on, jump into TRIAL with it running (no restart). */
+    scenario_update_ready();
+    g_wdg_starts = 0;
+    CHECK(boot_once() == BOOT_JUMP && g_wdg_starts == 1);
+    CHECK(meta().state == OTA_STATE_TRIAL);
+
+    /* After confirm: clean boot without watchdog. */
+    ota_meta_confirm(&g_dev);
+    g_wdg_starts = 0;
+    CHECK(boot_once() == BOOT_JUMP && g_wdg_starts == 0);
+
+    /* Rejected download: watchdog was needed, so restart once. */
+    scenario_update_ready();
+    F.mem[EXT_SLOT_DOWNLOAD + OTA_HDR_SIZE + 100] ^= 1;
+    g_wdg_starts = 0;
+    CHECK(boot_once() == BOOT_RESET && g_wdg_starts == 1);
+    CHECK(boot_once() == BOOT_JUMP && g_wdg_starts == 1);      /* no new start */
+
+    /* Rollback: restart once, then clean boot of the old app. */
+    scenario_rollback_due();
+    CHECK(boot_once() == BOOT_RESET && mcu_holds(&APP_V1));
+    g_wdg_starts = 0;
+    CHECK(boot_once() == BOOT_JUMP && g_wdg_starts == 0);
+}
+
 static void test_python_image(const char *path)
 {
     FILE *f = fopen(path, "rb");
@@ -497,21 +634,29 @@ static void test_python_image(const char *path)
     fclose(f);
     CHECK(len > OTA_HDR_SIZE);
     w25q_init(&g_dev, &FAKE_BUS);
-    CHECK(ota_image_check_slot(&g_dev, EXT_SLOT_DOWNLOAD, &h, buf, sizeof buf) == OTA_IMG_OK);
+    CHECK(ota_image_check_slot(&g_dev, EXT_SLOT_DOWNLOAD, &h, buf, sizeof buf, OTA_PUBLIC_KEY) == OTA_IMG_OK);
     CHECK(h.fw_version == OTA_VERSION(1, 3, 0));
     CHECK((long)(h.image_size + OTA_HDR_SIZE) == len);
 
-    /* And the bootloader installs it. */
+    /* And the bootloader (built with the dev key) installs it. */
+    g_pubkey = OTA_PUBLIC_KEY;
     install_direct(&APP_V1);
     ota_meta_set_pending(&g_dev, h.fw_version);
     CHECK(do_boot() == BOOT_JUMP);
     CHECK(memcmp(g_mcu, F.mem + EXT_SLOT_DOWNLOAD + OTA_HDR_SIZE, h.image_size) == 0);
-    printf("  python-made image accepted and installed (%u bytes)\n", (unsigned)h.image_size);
+    g_pubkey = g_pub;
+    printf("  python-made, dev-key-signed image accepted and installed (%u bytes)\n", (unsigned)h.image_size);
 }
 
 int main(int argc, char **argv)
 {
     g_verbose = getenv("VERBOSE") != NULL;
+    uECC_set_rng(rng);
+    if (!uECC_make_key(g_pub, g_priv, uECC_secp256r1()) ||
+        !uECC_make_key(g_other_pub, g_other_priv, uECC_secp256r1())) {
+        printf("uECC_make_key failed\n");
+        return 2;
+    }
     fake_new_chip();
     make_app(&APP_V1, 73 * 1024 + 4, OTA_VERSION(1, 2, 0), 1);
     make_app(&APP_V2, 76 * 1024 + 100, OTA_VERSION(1, 3, 0), 2);
@@ -531,6 +676,11 @@ int main(int argc, char **argv)
     test_install_failure_rolls_back();
     test_damaged_app_recovered_from_backup();
     test_factory_slot_used_when_backup_bad();
+    test_unsigned_rejected();
+    test_wrong_key_rejected();
+    test_tampered_header_rejected();
+    test_signature_api();
+    test_watchdog_usage();
     test_power_cut_sweep_update();
     test_power_cut_sweep_rollback();
     test_double_power_cut();

@@ -8,6 +8,15 @@ Built by `tests/ota_test_app/build.sh`. Test firmware only, not for products.
 | `testapp_v1.1.ota` | Good update. Must install and confirm. |
 | `testapp_v1.2_noconfirm.ota` | Never confirms, resets every 10 s. Bootloader must roll back to v1.1. |
 | `testapp_v1.3_corrupt.ota` | One byte damaged. Must be rejected, device stays on its version. |
+| `testapp_v1.4_hang.ota` | Hangs without feeding the watchdog. Watchdog resets it 3 times, then rollback. |
+| `testapp_v1.5_unsigned.ota` | No signature. Must be rejected. |
+| `testapp_v1.6_wrongkey.ota` | Signed with a different key. Must be rejected. |
+
+Good files are signed with the **development key** (`tools/dev_keys`). The
+bootloader in `bootloader_testapp_v1.0.bin` trusts only that key.
+
+Command `f` in the test app marks the download slot PENDING without checking
+it, to test that the bootloader rejects bad files by itself.
 
 ## Sending files (Mac / Linux / Windows)
 

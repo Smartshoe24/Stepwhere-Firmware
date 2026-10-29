@@ -109,7 +109,7 @@ until the new app is confirmed.
 * Core 3.0.0 changed `HardwareSerial(rx, tx)`; the current firmware only
   builds on the 2.x core.
 
-## Bootloader (`bootloader/`, v0.1.0)
+## Bootloader (`bootloader/`, v0.2.0)
 
 Plain C, register level, no HAL. Build: `make -C bootloader` (needs
 `arm-none-eabi-gcc`). Current size about 8 KB of the 16 KB area.
@@ -126,11 +126,24 @@ Plain C, register level, no HAL. Build: `make -C bootloader` (needs
 * Before jumping: flash put in power-down, SysTick and NVIC cleared, SPI1 and
   USART1 reset, instruction cache flushed, `SCB->VTOR = 0x08004000`.
 
-Not in v0.1.0 yet:
+Signatures (v0.2.0): images in the download slot must be signed (ECDSA
+P-256, micro-ecc). The public key is `libraries/StepwhereOTA/src/ota_public_key.h`.
+The committed key is a DEVELOPMENT key (`tools/dev_keys`); the bootloader
+prints a warning at boot while it is used. Backup and factory slots are
+written by the bootloader / factory and are checked by SHA-256 only.
 
-* ECDSA signature check (images are accepted on header CRC + SHA-256).
-* Watchdog. Without it, an app that hangs (instead of resetting) during a
-  trial is not rolled back until something resets the board.
+Watchdog (v0.2.0): IWDG, ~20 s, started only when the boot is not a plain
+IDLE boot (install, trial, rollback). It cannot be stopped, so:
+
+* an app in TRIAL must feed it (`IWDG->KR = 0xAAAA`) until it confirms, and
+  should reset once after `ota_meta_confirm()` to run without it;
+* after work that ends in IDLE (rollback, rejected image) the bootloader
+  resets once itself, so the app always starts without the watchdog.
+
+Normal boots never start it, so long deep sleeps in the app are unaffected.
+
+Still to do:
+
 * Battery check before installing. The app must only mark an update PENDING
   when the battery is high enough.
 
@@ -153,5 +166,5 @@ with no metadata the bootloader just starts it.
   LDO_EN-switched one (the self-test reports it). If it is switched, the
   bootloader must enable LDO_EN before touching the flash.
 * Confirm board selection: G070CBTx (BOM) vs G071CB (comment in stepwhere.ino).
-* Bootloader: ECDSA verify, watchdog, battery check.
+* Production signing key (keygen on a trusted machine, GitHub secret).
 * App-side OTA client for the N706B, GitHub Actions workflow, hosting.

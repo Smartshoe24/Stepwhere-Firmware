@@ -30,3 +30,6 @@ __pycache__/
 !prebuilt/*.bin
 !prebuilt/**/*.bin
 !prebuilt/**/*.hex
+
+# Development signing key (public on purpose, see tools/dev_keys/README.md)
+!tools/dev_keys/*.pem

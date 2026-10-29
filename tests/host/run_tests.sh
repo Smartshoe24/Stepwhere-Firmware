@@ -11,7 +11,7 @@ PY="${PYTHON:-python3}"
 SAN=""
 [ "${SANITIZE:-0}" = "1" ] && SAN="-fsanitize=address,undefined"
 CFLAGS="-std=c11 -Wall -Wextra -Werror -O1 -g $SAN -I$SRC -I$HOST -I$ROOT/bootloader/src"
-LIBSRC="$SRC/w25q.c $SRC/ota_crc32.c $SRC/ota_sha256.c $SRC/ota_image.c $SRC/ota_meta.c"
+LIBSRC="$SRC/w25q.c $SRC/ota_crc32.c $SRC/ota_sha256.c $SRC/ota_image.c $SRC/ota_meta.c $SRC/ota_uecc.c"
 
 echo "== W25Q128 driver"
 ${CC:-cc} $CFLAGS "$HOST/test_w25q.c" "$HOST/fake_w25q.c" $LIBSRC -o "$HOST/test_w25q.out"
@@ -26,7 +26,8 @@ import struct, sys
 sys.path.insert(0, sys.argv[1])
 import ota_tool as t
 app = struct.pack("<II", 0x20009000, 0x08004101) + bytes((i * 13 + 5) & 0xFF for i in range(70000))
-open(sys.argv[2], "wb").write(t.build_image(app, t.parse_version("1.3.0"), t.OTA_HW_ID_GSM_PCB_R1))
+key = t.load_private_key(sys.argv[1] + "/dev_keys/ota_signing_key.pem")
+open(sys.argv[2], "wb").write(t.build_image(app, t.parse_version("1.3.0"), t.OTA_HW_ID_GSM_PCB_R1, key=key))
 EOF
 ${CC:-cc} $CFLAGS "$HOST/test_boot.c" "$HOST/fake_w25q.c" "$ROOT/bootloader/src/boot_core.c" $LIBSRC \
     -o "$HOST/test_boot.out"

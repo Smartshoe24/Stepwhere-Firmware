@@ -1,0 +1,6 @@
+micro-ecc by Kenneth MacKay, BSD 2-Clause (LICENSE.txt)
+https://github.com/kmackay/micro-ecc commit 541b3a78026420a3e369c4c9281c396b5e531113
+
+Changes: AVR files removed; uECC.c renamed to uECC.c.inc so the Arduino
+build does not compile it directly. It is compiled through ../ota_uecc.c
+with the configuration in ../ota_uecc.h.
