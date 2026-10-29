@@ -13,6 +13,18 @@ implemented in `libraries/StepwhereOTA/src/ota_layout.h` and
 | Neoway N706B | LTE Cat-1 modem on USART2, downloads the image over HTTP(S) |
 | 3.7 V 1500 mAh Li-ion | Update only when battery is high enough |
 
+## W25Q128 wiring (from schematic)
+
+| W25Q pin | Signal | STM32 pin | Notes |
+|---|---|---|---|
+| 1 | /CS | PC6 (pin 30) | GPIO, active low |
+| 2 | DO | PA6 (pin 17) | SPI1_MISO |
+| 5 | DI | PA7 (pin 18) | SPI1_MOSI |
+| 6 | CLK | PA5 (pin 16) | SPI1_SCK |
+| 3 | /WP | PC7 (pin 31) | drive HIGH in app and bootloader |
+| 7 | /HOLD | PB12 (pin 24) | drive HIGH in app and bootloader |
+| 8 | VCC | 3.3 V LDO | which rail (always-on or LDO_EN) is checked by the self-test |
+
 ## Update flow
 
 ```
@@ -107,8 +119,9 @@ until the new app is confirmed.
 
 ## Open items
 
-* W25Q128 pin mapping on the STM32 (waiting for schematic). The self-test
-  currently guesses SPI1 on PA5/PA6/PA7, CS on PA4.
+* Confirm whether the flash VCC is the always-on 3.3 V rail or the
+  LDO_EN-switched one (the self-test reports it). If it is switched, the
+  bootloader must enable LDO_EN before touching the flash.
 * Confirm board selection: G070CBTx (BOM) vs G071CB (comment in stepwhere.ino).
 * Bootloader (LL drivers, SHA-256, ECDSA verify, state machine).
 * App-side OTA client for the N706B, GitHub Actions workflow, hosting.

@@ -37,8 +37,8 @@ arduino-cli compile --fqbn $FQBN --build-property build.flash_offset=0x4000 --ou
 
 ## Flash self-test
 
-1. Check the pin defines at the top of `tests/flash_selftest/flash_selftest.ino`
-   against the schematic.
+1. Pins are set from the schematic: SPI1 on PA5/PA6/PA7, /CS PC6, /WP PC7,
+   /HOLD PB12.
 2. Build it and flash `flash_selftest.ino.bin` (or `.hex`) with STM32CubeProgrammer
    as usual, at address `0x08000000`.
 3. Open the debug UART (USART1: PB6 TX, PB7 RX, 115200 baud). It prints each

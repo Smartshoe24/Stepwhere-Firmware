@@ -16,19 +16,19 @@
 #include <w25q.h>
 
 // ---------------------------------------------------------------------------
-// !!! PIN GUESS - CONFIRM AGAINST THE SCHEMATIC BEFORE TRUSTING THE RESULT !!!
-// SPI1 on PA5/PA6/PA7 with CS on PA4 is a guess: these are the SPI1 pins not
-// used by anything else in stepwhere.ino.
+// Pin mapping from the GSM PCB schematic (IC8 = W25Q128, IC4 = STM32G070CB)
 // ---------------------------------------------------------------------------
-#define FLASH_MOSI PA7   // -> W25Q pin 5 (DI)
-#define FLASH_MISO PA6   // <- W25Q pin 2 (DO)
-#define FLASH_SCK  PA5   // -> W25Q pin 6 (CLK)
-#define FLASH_CS   PA4   // -> W25Q pin 1 (/CS)
+#define FLASH_MOSI PA7   // MCU pin 18 -> W25Q pin 5 (DI),    SPI1_MOSI
+#define FLASH_MISO PA6   // MCU pin 17 <- W25Q pin 2 (DO),    SPI1_MISO
+#define FLASH_SCK  PA5   // MCU pin 16 -> W25Q pin 6 (CLK),   SPI1_SCK
+#define FLASH_CS   PC6   // MCU pin 30 -> W25Q pin 1 (/CS)
+#define FLASH_WP   PC7   // MCU pin 31 -> W25Q pin 3 (/WP),   driven HIGH
+#define FLASH_HOLD PB12  // MCU pin 24 -> W25Q pin 7 (/HOLD), driven HIGH
 
-#define LDO_EN     PA10  // GSM/GPS LDO, kept off during this test
+#define LDO_EN     PA10  // GSM/GPS LDO
 
 HardwareSerial SerialDBG(PB7, PB6);  // USART1 debug console (RX, TX)
-static W25QArduino flash(FLASH_MOSI, FLASH_MISO, FLASH_SCK, FLASH_CS);
+static W25QArduino flash(FLASH_MOSI, FLASH_MISO, FLASH_SCK, FLASH_CS, FLASH_WP, FLASH_HOLD);
 
 static int g_failures = 0;
 
@@ -72,20 +72,41 @@ static void run_selftest()
     SerialDBG.println();
     SerialDBG.println("=== Stepwhere W25Q128 flash self-test ===");
 
-    // 1. Init + JEDEC ID
-    st = flash.begin();
+    // 1. Init + JEDEC ID. First with the GSM/GPS LDO off. If the flash does
+    //    not answer, it may be powered from that LDO: switch it on and retry.
+    //    The result tells us which 3.3 V rail the flash is on.
     uint8_t manuf;
     uint16_t dev_id;
+    digitalWrite(LDO_EN, LOW);
+    delay(20);
+    st = flash.begin();
     w25q_read_jedec_id(dev, &manuf, &dev_id);  // re-read so it prints even if init failed
-    SerialDBG.print("JEDEC ID: ");
+    SerialDBG.print("JEDEC ID (LDO_EN off): ");
     SerialDBG.print(manuf, HEX);
     SerialDBG.print(' ');
     SerialDBG.println(dev_id, HEX);
+
+    if (st == W25Q_OK) {
+        SerialDBG.println("Flash power: always-on 3.3 V (works with LDO_EN off)");
+    } else {
+        digitalWrite(LDO_EN, HIGH);
+        delay(100);                            // same settle time as ldo_enable()
+        st = flash.begin();
+        w25q_read_jedec_id(dev, &manuf, &dev_id);
+        SerialDBG.print("JEDEC ID (LDO_EN on):  ");
+        SerialDBG.print(manuf, HEX);
+        SerialDBG.print(' ');
+        SerialDBG.println(dev_id, HEX);
+        if (st == W25Q_OK) {
+            SerialDBG.println("Flash power: switched by LDO_EN (PA10)");
+        }
+    }
     SerialDBG.println("  expected EF 4018 (W25Q128FV/JV-IQ) or EF 7018 (JV-IM)");
-    SerialDBG.println("  FF FFFF = no answer (check MISO/CS wiring, power)");
+    SerialDBG.println("  FF FFFF = no answer (check MISO/CS wiring, /HOLD, power)");
     SerialDBG.println("  0 0     = MISO stuck low");
     report("init + JEDEC ID", st);
     if (st != W25Q_OK) {
+        digitalWrite(LDO_EN, LOW);
         return;  // nothing else can work
     }
 
@@ -143,8 +164,9 @@ static void run_selftest()
     SerialDBG.println(" ms (datasheet: 150 typ, 2000 max)");
     report("erase 64 KB block", st);
 
-    // Leave the chip in low-power mode
+    // Leave the chip in low-power mode and the LDO off
     w25q_power_down(dev);
+    digitalWrite(LDO_EN, LOW);
 
     SerialDBG.println();
     SerialDBG.println(g_failures == 0 ? "RESULT: ALL TESTS PASSED" : "RESULT: FAILED");

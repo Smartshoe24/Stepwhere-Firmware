@@ -2,9 +2,14 @@
  * W25QArduino.h - Connects the plain-C w25q driver to the Arduino SPI library
  * (STM32duino core).
  *
- * Usage:
- *   static W25QArduino flash(PA7, PA6, PA5, PA4);   // MOSI, MISO, SCK, CS
+ * Usage (Stepwhere GSM PCB):
+ *   //                 MOSI MISO  SCK   CS    /WP   /HOLD
+ *   static W25QArduino flash(PA7, PA6, PA5, PC6, PC7, PB12);
  *   if (flash.begin() == W25Q_OK) { ... flash.dev() ... }
+ *
+ * /WP and /HOLD are wired to MCU pins on this board. They are driven HIGH:
+ * /HOLD low would pause the chip (reads return 0xFF) and /WP low can block
+ * status-register writes. Pass W25Q_NO_PIN if a pin is tied to 3.3 V.
  */
 #ifndef STEPWHERE_W25Q_ARDUINO_H
 #define STEPWHERE_W25Q_ARDUINO_H
@@ -14,18 +19,24 @@
 
 #include "w25q.h"
 
+#define W25Q_NO_PIN 0xFFFFFFFFUL
+
 class W25QArduino {
 public:
     /* clock_hz: the STM32 core picks the nearest lower prescaler. 16 MHz is
      * well below the 50 MHz limit of the 03h read command. */
     W25QArduino(uint32_t mosi, uint32_t miso, uint32_t sck, uint32_t cs,
+                uint32_t wp = W25Q_NO_PIN, uint32_t hold = W25Q_NO_PIN,
                 uint32_t clock_hz = 16000000UL)
-        : spi_(mosi, miso, sck), cs_(cs), settings_(clock_hz, MSBFIRST, SPI_MODE0) {}
+        : spi_(mosi, miso, sck), cs_(cs), wp_(wp), hold_(hold),
+          settings_(clock_hz, MSBFIRST, SPI_MODE0) {}
 
     w25q_status_t begin()
     {
         pinMode(cs_, OUTPUT);
         digitalWrite(cs_, HIGH);
+        if (wp_ != W25Q_NO_PIN)   { pinMode(wp_, OUTPUT);   digitalWrite(wp_, HIGH); }
+        if (hold_ != W25Q_NO_PIN) { pinMode(hold_, OUTPUT); digitalWrite(hold_, HIGH); }
         spi_.begin();
         /* Datasheet 9.3: wait tPUW (5 ms) after power-up before any write. */
         delay(5);
@@ -68,6 +79,8 @@ private:
 
     SPIClass    spi_;
     uint32_t    cs_;
+    uint32_t    wp_;
+    uint32_t    hold_;
     SPISettings settings_;
     w25q_t      dev_;
 };
