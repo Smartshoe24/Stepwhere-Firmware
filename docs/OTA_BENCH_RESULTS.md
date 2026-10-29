@@ -20,3 +20,17 @@ Notes
   the app must remember not to download it again.
 * Several unexplained resets were seen during testing (self-test, step 1, after
   step 5). To check: power wiring / battery connector, brown-out.
+
+## Bootloader v0.2.0 (signature + watchdog)
+
+| # | Test | Result |
+|---|---|---|
+| A | Signed update v1.1 | PASS: signature ok (app 531 ms at 64 MHz, bootloader 1693 ms at 16 MHz, checked twice), watchdog on during trial, app confirms and restarts, then watchdog off |
+| B | Hanging v1.4 | PASS: watchdog reset 3 times, rollback to v1.1 (backup hash check 425 ms), restart, watchdog off |
+| C1 | Unsigned v1.5, forced PENDING | PASS: app and bootloader both reject (not signed), restart, v1.1, last result "rejected bad image" |
+| C2 | Wrong-key v1.6, forced PENDING | PASS: app and bootloader both reject (bad signature), restart, v1.1 |
+
+Notes
+* Without metadata the bootloader backs up up to the last non-0xFF byte of the
+  app area; old data left by STM32CubeProgrammer (it only erases what it writes)
+  made the first backup 58,520 bytes. Use a full chip erase in production.
