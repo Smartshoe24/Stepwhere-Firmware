@@ -218,7 +218,7 @@ static void cmd_upload()
         SerialDBG.println("erase failed");
         return;
     }
-    SerialDBG.println("Ready. Send the .ota file now: Tera Term > File > Transfer > XMODEM > Send (tick 1K).");
+    SerialDBG.println("Ready. Send the .ota file now by XMODEM-1K (tools/ota_uart.py upload, or Tera Term).");
     long n = xmodem_receive();
     delay(500);
     flush_rx(100);
