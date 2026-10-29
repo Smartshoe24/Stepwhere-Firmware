@@ -24,3 +24,6 @@ __MACOSX/
 # Python
 __pycache__/
 .venv/
+
+# Test firmware shared for bench testing
+!prebuilt/*.hex
