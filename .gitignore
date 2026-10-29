@@ -28,3 +28,5 @@ __pycache__/
 # Test firmware shared for bench testing
 !prebuilt/*.hex
 !prebuilt/*.bin
+!prebuilt/**/*.bin
+!prebuilt/**/*.hex
