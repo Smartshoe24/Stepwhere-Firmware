@@ -139,6 +139,26 @@ static uint32_t app_used_size(const boot_port_t *p)
     return n;
 }
 
+/* The metadata describes the app the bootloader installed. If someone has
+ * flashed a different app by cable since then, forget the stored version and
+ * size so the backup is labelled "unknown" (v0.0.0) instead of wrongly. */
+static void forget_if_app_changed(const boot_port_t *p)
+{
+    uint8_t digest[OTA_SHA256_LEN];
+    uint32_t n = s_meta.installed_size;
+    if (n < 8u || n > APP_MAX_SIZE) {
+        return;
+    }
+    ota_sha256(p->app_mem, n, digest);
+    if (memcmp(digest, s_meta.installed_sha256, OTA_SHA256_LEN) != 0) {
+        blog(p, "app differs from installed v%v (flashed by cable?), version unknown",
+             s_meta.installed_version);
+        s_meta.installed_version = 0;
+        s_meta.installed_size = 0;
+        memset(s_meta.installed_sha256, 0, OTA_SHA256_LEN);
+    }
+}
+
 /* Copy the current internal app into the backup slot as a normal image.
  * The header is written last, so a half-written backup is never valid. */
 static bool backup_app(const boot_port_t *p)
@@ -292,6 +312,9 @@ static boot_result_t run_states(const boot_port_t *p)
             break;
 
         case OTA_STATE_BACKING_UP:
+            if (boot_app_valid(p)) {
+                forget_if_app_changed(p);
+            }
             if (boot_app_valid(p) && !backup_app(p)) {
                 s_meta.last_result = OTA_RES_INSTALL_FAILED;
                 if (!save_meta(p, OTA_STATE_IDLE)) return BOOT_JUMP;

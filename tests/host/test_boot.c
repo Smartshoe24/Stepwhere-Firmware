@@ -620,6 +620,37 @@ static void test_watchdog_usage(void)
     CHECK(boot_once() == BOOT_JUMP && g_wdg_starts == 0);
 }
 
+static void test_cable_reflash_detected(void)
+{
+    ota_image_header_t h;
+    uint8_t buf[512];
+    app_t *v3 = malloc(sizeof *v3);
+    make_app(v3, 50 * 1024 + 8, OTA_VERSION(1, 4, 0), 3);
+
+    scenario_update_ready();
+    do_boot();                              /* v2 installed over the air */
+    ota_meta_confirm(&g_dev);
+    CHECK(meta().installed_version == APP_V2.version);
+    install_direct(&APP_V1);                /* someone flashes v1 by cable */
+
+    put_image(EXT_SLOT_DOWNLOAD, v3);
+    fake_power_cycle();
+    w25q_init(&g_dev, &FAKE_BUS);
+    ota_meta_set_pending(&g_dev, v3->version);
+    CHECK(do_boot() == BOOT_JUMP && mcu_holds(v3));
+
+    /* Backup must hold the v1 bytes, labelled unknown, not "v2". */
+    CHECK(ota_image_check_slot(&g_dev, EXT_SLOT_BACKUP, &h, buf, sizeof buf, NULL) == OTA_IMG_OK);
+    /* size unknown -> measured up to the last programmed 8-byte word */
+    CHECK(h.fw_version == 0 && h.image_size >= APP_V1.size && h.image_size < APP_V1.size + 8);
+    CHECK(memcmp(F.mem + EXT_SLOT_BACKUP + OTA_HDR_SIZE, APP_V1.bytes, APP_V1.size) == 0);
+
+    /* Rolling back restores the cable-flashed v1. */
+    do_boot(); do_boot(); do_boot();
+    CHECK(mcu_holds(&APP_V1) && meta().last_result == OTA_RES_ROLLED_BACK);
+    free(v3);
+}
+
 static void test_python_image(const char *path)
 {
     FILE *f = fopen(path, "rb");
@@ -681,6 +712,7 @@ int main(int argc, char **argv)
     test_tampered_header_rejected();
     test_signature_api();
     test_watchdog_usage();
+    test_cable_reflash_detected();
     test_power_cut_sweep_update();
     test_power_cut_sweep_rollback();
     test_double_power_cut();

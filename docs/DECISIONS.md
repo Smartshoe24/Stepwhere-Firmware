@@ -31,7 +31,7 @@ made; never delete one, mark it "Replaced by D-xx" instead.
 ## Follow-ups noted (not OTA, tracked here so they are not lost)
 
 * Location uploads go over plain HTTP; move to **HTTPS** (children's location data). Handled in the firmware-fixes work.
-* After a cable reflash the metadata version can be stale (seen: shows v1.1.0 while v1.0.0 runs). Fix: bootloader compares stored SHA-256 with the app; app reports its compiled-in version.
+* ~~Stale version after cable reflash~~: fixed in bootloader v0.2.2 (compares stored SHA-256 with the app before backup). Apps should still report their compiled-in version to the server.
 * Production programming must use a full chip erase (old data inflated the first backup to 58 KB).
 * Unexplained resets seen on the bench board a few times: check power / battery connector / brown-out.
 * LIS2DH12 replaces LIS2DS12 (no hardware pedometer): software step counter, separate task.
