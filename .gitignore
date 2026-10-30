@@ -35,3 +35,6 @@ __pycache__/
 !tools/dev_keys/*.pem
 # Production PUBLIC key (safe to commit; the private key is never in the repo)
 !tools/production_public_key.pem
+
+# CI output
+dist/

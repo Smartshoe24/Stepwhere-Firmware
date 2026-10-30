@@ -22,6 +22,12 @@ made; never delete one, mark it "Replaced by D-xx" instead.
 | D-15 | 2026-10-30 | Device URL is fw.stepwhere.in (CNAME at GoDaddy → CloudFront) | Storage can move without a firmware change | Hard-coding the cloudfront.net name |
 | D-16 | 2026-10-30 | Device checks manifest.json once a day, only when GSM is already on | Near-zero extra battery; no backend change. Server-pushed trigger can come later for staged rollouts | Server flag in location reply (later option) |
 
+| D-17 | 2026-10-30 | Probe the N706B download methods on hardware before writing the downloader | Firmware only ever POSTed; no AT manual available; resume needs byte ranges | Guess from other Neoway modules |
+| D-18 | 2026-10-30 | CI on every push (host tests incl. sanitizers, all builds); release only on v* tags, toolchain pinned (core 2.12.0, libs) | Reproducible builds; tag = deliberate release | Release on every main push |
+| D-19 | 2026-10-30 | Release gates: tag == APP_VERSION, firmware calls ota_meta_confirm(), signature verifies with committed production public key, version newer than published, human approval in GitHub environment | Each one prevents a fleet-wide failure (rollback loop, wrong key, downgrade, accident) | Unattended publish |
+| D-20 | 2026-10-30 | Signing key stored only as a GitHub environment secret (firmware-release) + offline backup | Secret usable only by approved tag runs, never readable again | Repo-level secret, key on a build PC |
+| D-21 | 2026-10-30 | Upload image first, manifest last; manifest cached 60 s, images immutable | Devices never see a manifest pointing at a missing file | Single upload order-free |
+
 ## Follow-ups noted (not OTA, tracked here so they are not lost)
 
 * Location uploads go over plain HTTP; move to **HTTPS** (children's location data). Handled in the firmware-fixes work.

@@ -1,0 +1,43 @@
+# Runs on every push and pull request: PC tests, then builds every firmware.
+# Nothing is signed or published here.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install cryptography
+      - name: Unit tests (W25Q driver, bootloader state machine, power cuts, tools)
+        run: SANITIZE=1 sh tests/host/run_tests.sh
+
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: ./.github/actions/setup-stm32
+      - name: Build bootloader, firmware, bench tools
+        run: sh tools/ci_build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ github.sha }}
+          path: dist/
+          retention-days: 30
