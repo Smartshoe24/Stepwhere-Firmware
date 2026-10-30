@@ -34,3 +34,16 @@ Notes
 * Without metadata the bootloader backs up up to the last non-0xFF byte of the
   app area; old data left by STM32CubeProgrammer (it only erases what it writes)
   made the first backup 58,520 bytes. Use a full chip erase in production.
+
+## Bootloader v0.2.1 (production key 59C07275)
+
+| # | Test | Result |
+|---|---|---|
+| P1 | v1.1 signed on the key owner's Mac | PASS: signature ok (1704 ms), install, confirm, restart, watchdog off |
+| P2 | v1.5 signed with the old dev key, forced PENDING | PASS: app and bootloader reject (bad signature), restart, app unchanged |
+
+Open issue found
+* After re-flashing the app by cable, the metadata still said "installed v1.1.0"
+  while v1.0.0 was running. The bootloader trusts the stored version. Fix planned:
+  compare the stored SHA-256 with the app in flash when backing up, and the app
+  should report its own compiled-in version to the server.
