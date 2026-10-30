@@ -1,13 +1,9 @@
 #!/bin/sh
 # Builds the OTA bench-test set into prebuilt/ota_test/:
 #   bootloader_testapp_v1.0.bin/.hex  bootloader + test app v1.0, flash at 0x08000000
-#   testapp_v1.1.ota                  good update
-#   testapp_v1.2_noconfirm.ota        update that never confirms -> rollback
-#   testapp_v1.3_corrupt.ota          damaged file -> must be rejected
-#   testapp_v1.4_hang.ota             hangs -> watchdog reset -> rollback
-#   testapp_v1.5_unsigned.ota         no signature -> must be rejected
-#   testapp_v1.6_wrongkey.ota         signed with another key -> must be rejected
-# All good files are signed with the DEVELOPMENT key (tools/dev_keys).
+#   app_bins/testapp_v1.*.bin         unsigned apps; sign them with sign_with_my_key.sh
+#   testapp_v1.5_devkey.ota           signed with the dev key -> must be rejected
+#   testapp_v1.6_unsigned.ota         no signature -> must be rejected
 #
 # Needs arduino-cli with the STM32 core 2.x, arm-none-eabi-gcc (for the
 # bootloader) and Python 3. Set ARDUINO_CLI and CROSS if not on PATH.
@@ -52,18 +48,18 @@ for line in open(sys.argv[1]):
 lo, hi = min(mem), max(mem) + 1
 open(sys.argv[2], "wb").write(bytes(mem.get(a, 0xFF) for a in range(lo, hi)))
 EOF
-KEY="$ROOT/tools/dev_keys/ota_signing_key.pem"
-rm -f "$OUT"/*.ota
-"$PY" "$ROOT/tools/ota_tool.py" pack --bin "$TMP/v1.1/$BIN" --version 1.1.0 --key "$KEY" --out "$OUT/testapp_v1.1.ota"
-"$PY" "$ROOT/tools/ota_tool.py" pack --bin "$TMP/v1.2/$BIN" --version 1.2.0 --key "$KEY" --out "$OUT/testapp_v1.2_noconfirm.ota"
-"$PY" "$ROOT/tools/ota_tool.py" pack --bin "$TMP/v1.3/$BIN" --version 1.3.0 --key "$KEY" --out "$OUT/testapp_v1.3_corrupt.ota"
-"$PY" "$ROOT/tools/ota_tool.py" pack --bin "$TMP/v1.4/$BIN" --version 1.4.0 --key "$KEY" --out "$OUT/testapp_v1.4_hang.ota"
-"$PY" "$ROOT/tools/ota_tool.py" pack --bin "$TMP/v1.5/$BIN" --version 1.5.0 --out "$OUT/testapp_v1.5_unsigned.ota"
-rm -rf "$TMP/otherkey"
-"$PY" "$ROOT/tools/ota_tool.py" keygen --out "$TMP/otherkey" > /dev/null
-"$PY" "$ROOT/tools/ota_tool.py" pack --bin "$TMP/v1.6/$BIN" --version 1.6.0 --key "$TMP/otherkey/ota_signing_key.pem" \
-    --out "$OUT/testapp_v1.6_wrongkey.ota"
-# Flip one byte in the middle of the payload: SHA-256 check must fail.
-"$PY" -c "import sys; p=sys.argv[1]; b=bytearray(open(p,'rb').read()); b[len(b)//2]^=0xFF; open(p,'wb').write(b)" \
-    "$OUT/testapp_v1.3_corrupt.ota"
+# The bootloader above trusts the key in libraries/StepwhereOTA/src/ota_public_key.h
+# (production key). Files for it must be signed on the key owner's machine:
+# tests/ota_test_app/sign_with_my_key.sh turns app_bins/*.bin into .ota files.
+rm -rf "$OUT"/*.ota "$OUT/app_bins"
+mkdir -p "$OUT/app_bins"
+cp "$TMP/v1.1/$BIN" "$OUT/app_bins/testapp_v1.1.bin"
+cp "$TMP/v1.2/$BIN" "$OUT/app_bins/testapp_v1.2_noconfirm.bin"
+cp "$TMP/v1.3/$BIN" "$OUT/app_bins/testapp_v1.3.bin"
+cp "$TMP/v1.4/$BIN" "$OUT/app_bins/testapp_v1.4_hang.bin"
+# Files that must be REJECTED by a production-key board:
+DEVKEY="$ROOT/tools/dev_keys/ota_signing_key.pem"
+"$PY" "$ROOT/tools/ota_tool.py" pack --bin "$TMP/v1.5/$BIN" --version 1.5.0 --key "$DEVKEY" \
+    --out "$OUT/testapp_v1.5_devkey.ota"
+"$PY" "$ROOT/tools/ota_tool.py" pack --bin "$TMP/v1.6/$BIN" --version 1.6.0 --out "$OUT/testapp_v1.6_unsigned.ota"
 ls -l "$OUT"

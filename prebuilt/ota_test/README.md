@@ -1,30 +1,24 @@
-# OTA bench test files
+# OTA bench test files (production key)
 
-Built by `tests/ota_test_app/build.sh`. Test firmware only, not for products.
+The bootloader in `bootloader_testapp_v1.0.bin` trusts only the **production key**
+(fingerprint `59C07275`, see `tools/production_public_key.pem`). It prints
+`[BOOT] signing key 59C07275` at boot.
 
 | File | Use |
 |---|---|
-| `bootloader_testapp_v1.0.bin` | Flash at **0x08000000** with STM32CubeProgrammer (bootloader + test app v1.0) |
-| `testapp_v1.1.ota` | Good update. Must install and confirm. |
-| `testapp_v1.2_noconfirm.ota` | Never confirms, resets every 10 s. Bootloader must roll back to v1.1. |
-| `testapp_v1.3_corrupt.ota` | One byte damaged. Must be rejected, device stays on its version. |
-| `testapp_v1.4_hang.ota` | Hangs without feeding the watchdog. Watchdog resets it 3 times, then rollback. |
-| `testapp_v1.5_unsigned.ota` | No signature. Must be rejected. |
-| `testapp_v1.6_wrongkey.ota` | Signed with a different key. Must be rejected. |
+| `bootloader_testapp_v1.0.bin` | Flash at **0x08000000** (bootloader v0.2.1 + test app v1.0) |
+| `app_bins/*.bin` | Unsigned test apps. Sign them yourself (below). |
+| `testapp_v1.5_devkey.ota` | Signed with the old development key. Must be rejected (bad signature). |
+| `testapp_v1.6_unsigned.ota` | No signature. Must be rejected. |
 
-Good files are signed with the **development key** (`tools/dev_keys`). The
-bootloader in `bootloader_testapp_v1.0.bin` trusts only that key.
-
-Command `f` in the test app marks the download slot PENDING without checking
-it, to test that the bootloader rejects bad files by itself.
-
-## Sending files (Mac / Linux / Windows)
+Sign on the key owner's Mac:
 
 ```sh
-pip3 install pyserial
-python3 tools/ota_uart.py ports                                   # find the port
-python3 tools/ota_uart.py monitor --port /dev/cu.usbserial-XXXX   # terminal, keys i/u/r/e/h
-python3 tools/ota_uart.py upload  --port /dev/cu.usbserial-XXXX prebuilt/ota_test/testapp_v1.1.ota --reset
+sh tests/ota_test_app/sign_with_my_key.sh ~/stepwhere-keys/ota_signing_key.pem
 ```
 
-On Windows, Tera Term also works: press `u`, then File > Transfer > XMODEM > Send, tick **1K**.
+This creates `testapp_v1.1.ota` (good), `testapp_v1.2_noconfirm.ota` (rollback),
+`testapp_v1.3_corrupt.ota` (rejected) and `testapp_v1.4_hang.ota` (watchdog).
+
+Upload: `python3 tools/ota_uart.py upload --port /dev/cu.usbserial-XXXX FILE --reset`.
+Test app command `f` marks the download slot PENDING without checks.

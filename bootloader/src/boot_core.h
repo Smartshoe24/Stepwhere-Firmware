@@ -12,7 +12,7 @@
 
 #include "w25q.h"
 
-#define BOOT_VERSION_STR "0.2.0"
+#define BOOT_VERSION_STR "0.2.1"
 
 typedef struct {
     void *ctx;

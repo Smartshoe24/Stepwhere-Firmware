@@ -352,6 +352,15 @@ int main(void)
 #if OTA_PUBLIC_KEY_IS_DEV
     log_line(NULL, "[BOOT] WARNING: development signing key, not for products");
 #endif
+    {
+        static const char hx[] = "0123456789ABCDEF";
+        char line[] = "[BOOT] signing key 00000000";
+        for (int i = 0; i < 4; i++) {
+            line[19 + 2 * i] = hx[OTA_PUBLIC_KEY[i] >> 4];
+            line[20 + 2 * i] = hx[OTA_PUBLIC_KEY[i] & 15];
+        }
+        log_line(NULL, line);
+    }
 
     boot_result_t r = boot_run(&port);
     if (r == BOOT_JUMP) {

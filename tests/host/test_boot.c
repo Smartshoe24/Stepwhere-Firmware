@@ -20,7 +20,7 @@
 #include "ota_image.h"
 #include "ota_layout.h"
 #include "ota_meta.h"
-#include "ota_public_key.h"
+#include "../../tools/dev_keys/ota_public_key.h"   /* dev key: test images are dev-signed */
 #include "ota_sha256.h"
 #include "ota_uecc.h"
 #include "w25q.h"

@@ -109,7 +109,7 @@ until the new app is confirmed.
 * Core 3.0.0 changed `HardwareSerial(rx, tx)`; the current firmware only
   builds on the 2.x core.
 
-## Bootloader (`bootloader/`, v0.2.0)
+## Bootloader (`bootloader/`, v0.2.1)
 
 Plain C, register level, no HAL. Build: `make -C bootloader` (needs
 `arm-none-eabi-gcc`). Current size about 8 KB of the 16 KB area.
@@ -128,8 +128,12 @@ Plain C, register level, no HAL. Build: `make -C bootloader` (needs
 
 Signatures (v0.2.0): images in the download slot must be signed (ECDSA
 P-256, micro-ecc). The public key is `libraries/StepwhereOTA/src/ota_public_key.h`.
-The committed key is a DEVELOPMENT key (`tools/dev_keys`); the bootloader
-prints a warning at boot while it is used. Backup and factory slots are
+Since v0.2.1 this is the PRODUCTION key (fingerprint `59C07275`, PEM copy in
+`tools/production_public_key.pem`). The private key exists only on the key
+owner's machine and in its backup; it will be a GitHub secret for CI. The
+bootloader prints `[BOOT] signing key <fingerprint>` at every boot. The old
+development key (`tools/dev_keys`) is now only used by host tests and to make
+"must be rejected" bench files. Backup and factory slots are
 written by the bootloader / factory and are checked by SHA-256 only.
 
 Watchdog (v0.2.0): IWDG, ~20 s, started only when the boot is not a plain
@@ -166,5 +170,5 @@ with no metadata the bootloader just starts it.
   LDO_EN-switched one (the self-test reports it). If it is switched, the
   bootloader must enable LDO_EN before touching the flash.
 * Confirm board selection: G070CBTx (BOM) vs G071CB (comment in stepwhere.ino).
-* Production signing key (keygen on a trusted machine, GitHub secret).
+* Add the production private key as GitHub secret OTA_SIGNING_KEY (CI step).
 * App-side OTA client for the N706B, GitHub Actions workflow, hosting.
