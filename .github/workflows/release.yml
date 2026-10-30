@@ -1,0 +1,134 @@
+# Publishes a firmware release to the devices when a version tag is pushed:
+#   git tag v1.3.0 && git push origin v1.3.0
+#
+# Safety gates (any failure stops the release, nothing is uploaded):
+#   1. tag == APP_VERSION in stepwhere/stepwhere.ino
+#   2. the firmware calls ota_meta_confirm() (otherwise every device would roll back)
+#   3. image signed with OTA_SIGNING_KEY verifies against tools/production_public_key.pem
+#   4. version is newer than the one currently published
+#   5. a person approves the "firmware-release" environment in GitHub
+#
+# One-time setup: docs/RELEASING.md
+name: Release firmware
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write     # create the GitHub Release
+  id-token: write     # AWS OIDC login
+
+concurrency:
+  group: firmware-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    environment: firmware-release
+    env:
+      AWS_REGION: ap-south-1
+      BUCKET: ${{ vars.FIRMWARE_BUCKET }}
+      DISTRIBUTION_ID: ${{ vars.FIRMWARE_DISTRIBUTION_ID }}
+      ROLE_ARN: ${{ vars.AWS_PUBLISH_ROLE_ARN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install cryptography
+
+      - name: "Gate 1-2: tag matches firmware version, firmware confirms itself"
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -e
+          SRC_VER=$(tr -d '\r' < stepwhere/stepwhere.ino | sed -n 's/^#define APP_VERSION "\(.*\)".*/\1/p')
+          python3 - "$TAG" "$SRC_VER" <<'EOF'
+          import sys
+          sys.path.insert(0, "tools")
+          from ota_tool import parse_version, version_str
+          tag, src = sys.argv[1], sys.argv[2]
+          if parse_version(tag) != parse_version(src):
+              sys.exit(f"tag {tag} != APP_VERSION {src!r} in stepwhere/stepwhere.ino")
+          print("version", version_str(parse_version(tag)))
+          EOF
+          if ! grep -q "ota_meta_confirm" stepwhere/stepwhere.ino; then
+            echo "::error::stepwhere.ino never calls ota_meta_confirm(); every device would roll back. Not publishing."
+            exit 1
+          fi
+
+      - name: Check release settings
+        env:
+          HAS_KEY: ${{ secrets.OTA_SIGNING_KEY != '' }}
+        run: |
+          missing=""
+          [ "$HAS_KEY" = "true" ] || missing="$missing secret:OTA_SIGNING_KEY"
+          [ -n "$BUCKET" ] || missing="$missing var:FIRMWARE_BUCKET"
+          [ -n "$DISTRIBUTION_ID" ] || missing="$missing var:FIRMWARE_DISTRIBUTION_ID"
+          [ -n "$ROLE_ARN" ] || missing="$missing var:AWS_PUBLISH_ROLE_ARN"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing in the firmware-release environment:$missing (see docs/RELEASING.md)"
+            exit 1
+          fi
+
+      - uses: ./.github/actions/setup-stm32
+      - name: Build
+        run: sh tools/ci_build.sh
+
+      - name: "Gate 3: sign and verify against the production public key"
+        env:
+          OTA_SIGNING_KEY: ${{ secrets.OTA_SIGNING_KEY }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -e
+          VER=$(python3 -c "import sys; sys.path.insert(0,'tools'); from ota_tool import parse_version, version_str; print(version_str(parse_version('$TAG')))")
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          python3 tools/ota_tool.py pack --bin dist/stepwhere_app.bin --version "$VER" \
+            --sign-from-env --git-sha "$GITHUB_SHA" \
+            --out "dist/stepwhere_$VER.ota" --manifest dist/manifest.json \
+            --url "releases/$VER/stepwhere.ota"
+          python3 tools/ota_tool.py verify "dist/stepwhere_$VER.ota" \
+            --pubkey tools/production_public_key.pem --require-signature
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: "Gate 4: newer than the published version"
+        run: |
+          set -e
+          if aws s3 cp "s3://$BUCKET/manifest.json" current.json 2>/dev/null; then
+            python3 - <<'EOF'
+          import json
+          cur = json.load(open("current.json"))["version_code"]
+          new = json.load(open("dist/manifest.json"))["version_code"]
+          if new <= cur:
+              raise SystemExit(f"new version {new:#x} is not newer than published {cur:#x}")
+          print(f"published {cur:#x} -> new {new:#x}")
+          EOF
+          else
+            echo "no manifest yet: first release"
+          fi
+
+      - name: Upload image, then manifest
+        run: |
+          set -e
+          aws s3 cp "dist/stepwhere_$VER.ota" "s3://$BUCKET/releases/$VER/stepwhere.ota" \
+            --content-type application/octet-stream \
+            --cache-control "public, max-age=31536000, immutable"
+          # The manifest goes last: devices only see the release once the image exists.
+          aws s3 cp dist/manifest.json "s3://$BUCKET/manifest.json" \
+            --content-type application/json --cache-control "public, max-age=60"
+          aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION_ID" \
+            --paths /manifest.json > /dev/null
+
+      - name: GitHub Release with factory image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" --title "Firmware $VER" --notes "OTA image and factory image for $VER." \
+            "dist/stepwhere_$VER.ota" dist/stepwhere_factory.hex dist/manifest.json dist/bootloader.hex

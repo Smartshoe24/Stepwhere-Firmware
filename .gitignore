@@ -1,0 +1,43 @@
+# Arduino / build output
+build/
+*.elf
+*.map
+*.hex
+*.bin
+
+# OTA output
+dist/
+
+# Signing keys: NEVER commit private keys
+keys/
+*.pem
+
+# Host test binaries
+tests/host/*.out
+
+# Editors / OS
+.DS_Store
+__MACOSX/
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+.venv/
+
+# Test firmware shared for bench testing
+!prebuilt/*.hex
+!prebuilt/*.bin
+!prebuilt/**/*.bin
+!prebuilt/**/*.hex
+
+# Development signing key (public on purpose, see tools/dev_keys/README.md)
+!tools/dev_keys/*.pem
+# Production PUBLIC key (safe to commit; the private key is never in the repo)
+!tools/production_public_key.pem
+
+# CI output
+dist/
+
+# Local update server content
+fw_server_root/
