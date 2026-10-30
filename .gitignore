@@ -38,3 +38,6 @@ __pycache__/
 
 # CI output
 dist/
+
+# Local update server content
+fw_server_root/

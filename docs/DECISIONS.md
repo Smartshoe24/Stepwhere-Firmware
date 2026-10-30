@@ -27,6 +27,7 @@ made; never delete one, mark it "Replaced by D-xx" instead.
 | D-19 | 2026-10-30 | Release gates: tag == APP_VERSION, firmware calls ota_meta_confirm(), signature verifies with committed production public key, version newer than published, human approval in GitHub environment | Each one prevents a fleet-wide failure (rollback loop, wrong key, downgrade, accident) | Unattended publish |
 | D-20 | 2026-10-30 | Signing key stored only as a GitHub environment secret (firmware-release) + offline backup | Secret usable only by approved tag runs, never readable again | Repo-level secret, key on a build PC |
 | D-21 | 2026-10-30 | Upload image first, manifest last; manifest cached 60 s, images immutable | Devices never see a manifest pointing at a missing file | Single upload order-free |
+| D-22 | 2026-10-30 | Local update server (tools/fw_server.py on the Mac + tunnel) first, AWS later | Faster to test; same layout as S3 (manifest.json, releases/<v>/stepwhere.ota), so moving to AWS only changes the device base URL. Server supports byte ranges like CloudFront | Deploy AWS first |
 
 ## Follow-ups noted (not OTA, tracked here so they are not lost)
 
