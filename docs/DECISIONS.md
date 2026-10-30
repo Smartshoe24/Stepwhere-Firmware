@@ -28,6 +28,10 @@ made; never delete one, mark it "Replaced by D-xx" instead.
 | D-20 | 2026-10-30 | Signing key stored only as a GitHub environment secret (firmware-release) + offline backup | Secret usable only by approved tag runs, never readable again | Repo-level secret, key on a build PC |
 | D-21 | 2026-10-30 | Upload image first, manifest last; manifest cached 60 s, images immutable | Devices never see a manifest pointing at a missing file | Single upload order-free |
 | D-22 | 2026-10-30 | Local update server (tools/fw_server.py on the Mac + tunnel) first, AWS later | Faster to test; same layout as S3 (manifest.json, releases/<v>/stepwhere.ota), so moving to AWS only changes the device base URL. Server supports byte ranges like CloudFront | Deploy AWS first |
+| D-23 | 2026-10-30 | OTA layout uses only the first 448 KB of external flash; driver uses only standard 25-series SPI NOR commands | Any 3.3 V SPI NOR of >= 4 Mbit can replace the W25Q128 with an ID-table + timeout change, same firmware for mixed boards (stock risk). Avoid SPI NAND / I2C EEPROM / 1.8 V parts | Chip-specific features (quad, security registers) |
+| D-24 | 2026-10-30 | Targeted updates (planned): device first reads devices/<IMEI>.json, then manifest.json; manifest may carry "rollout": N (% of devices by IMEI hash) | Test on chosen devices and staged rollouts with static files, no backend code; signature still required | Separate firmware per group |
+| D-25 | 2026-10-30 | Fleet monitoring: a "fw" block (app, boot, key, ota, last, avail, dl) added to the EXISTING location upload; admin shows versions per device | No extra connection or battery; agreed with owner. Admin-controlled rollouts come after monitoring | Separate /device-status endpoint |
+| D-26 | 2026-10-30 | Bootloader gets a fixed info block (version, key fingerprint) the app can read | So the app can report the bootloader version and trusted key | App guessing the bootloader version |
 
 ## Follow-ups noted (not OTA, tracked here so they are not lost)
 
@@ -35,4 +39,5 @@ made; never delete one, mark it "Replaced by D-xx" instead.
 * ~~Stale version after cable reflash~~: fixed in bootloader v0.2.2 (compares stored SHA-256 with the app before backup). Apps should still report their compiled-in version to the server.
 * Production programming must use a full chip erase (old data inflated the first backup to 58 KB).
 * Unexplained resets seen on the bench board a few times: check power / battery connector / brown-out.
+* Admin/backend repo access pending (owner shares later): implement storage and views for the fw block (D-25).
 * LIS2DH12 replaces LIS2DS12 (no hardware pedometer): software step counter, separate task.
