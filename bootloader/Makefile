@@ -19,7 +19,7 @@ SRCS := src/startup.c src/main.c src/boot_core.c \
 
 CFLAGS := -mcpu=cortex-m0plus -mthumb -Os -g -std=c11 \
           -Wall -Wextra -Werror \
-          -ffunction-sections -fdata-sections -fno-common \
+          -ffunction-sections -fdata-sections -fno-common -MMD -MP \
           -DSTM32G070xx -Icmsis -Isrc -I$(LIB)
 LDFLAGS := -mcpu=cortex-m0plus -mthumb -nostartfiles --specs=nano.specs --specs=nosys.specs \
            -Wl,--gc-sections -Wl,-Map=$(BUILD)/bootloader.map -Tstm32g070cb_boot.ld
@@ -44,6 +44,9 @@ $(BUILD)/bootloader.hex: $(BUILD)/bootloader.elf
 
 $(BUILD)/obj:
 	mkdir -p $@
+
+# Rebuild objects when any included header changes.
+-include $(OBJS:.o=.d)
 
 clean:
 	rm -rf $(BUILD)
