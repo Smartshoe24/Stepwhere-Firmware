@@ -55,7 +55,7 @@ I2C devices: 0x19
 [PASS] external flash for the log - W25Q128 ID EF 4018, log OK
 RESULT: ALL CHECKS PASSED
 #RECORDING session 1 to flash. You can unplug the cable now.
-#info RECORDING, session 1, log 0/62720 pages (0.0%), 13 h 56 min left, steps 0
+#info RECORDING, session 1, log 0/63488 pages (0.0%), 14 h 6 min left, steps 0
 ```
 
 **First time on each board**, erase the log area once: press `E`, then `y`
