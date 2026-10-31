@@ -21,7 +21,7 @@ Result words: **PASS** = works as expected, **FAIL** = does not work,
 | T4 | 2026-10-31 | `modem_power_test.bin` v0.1: modem power, power key polarity, UART line, baud/swap scan, GPS | FAIL: modem seems to start (PA3 becomes driven), but no byte at any baud, normal or swapped; GPS silent |
 | T5 | 2026-10-31 | Multimeter on IC1 (TXB0102) pins, modem off / on, with `modem_power_test.bin` v0.2 | FAIL: middle pins read 0 V (partly a probing miss, see T6) |
 | T6 | 2026-10-31 | Re-check IC1 middle pins at the pads (modem on) | **FAIL: VCCB (pin 7) = 0 V.** VCCA 1.8 V, OE 1.8 V, GND 0 V are correct. Root cause of "no AT answer" |
-| T7 | 2026-10-31 | Battery off: continuity checks around IC1 pin 7, then give VCCB 3.3 V, re-run `t` | OPEN |
+| T7 | 2026-10-31 | Battery off: continuity checks around IC1 pin 7, then give VCCB 3.3 V, re-run `t` | Part 1 done: empty footprint above IC1 feeds pin 7; its other pad is not on 3V3. Part 2 OPEN |
 
 ## T0: Already known before this log (from the handoff)
 
@@ -389,3 +389,23 @@ Status: OPEN, steps sent to the owner. Plan:
 4. Battery back, flash `modem_power_test.bin`, press `t`. Expected:
    `AT OK at 115200`, plus ATI / CPIN / CSQ / IMEI answers.
 5. Then the owner's LIS2DS12 firmware again (GSM + GPRS should come up).
+
+### T7 part 1: beep tests, battery off (2026-10-31)
+
+| From | To | Beep? | Meaning |
+|---|---|---|---|
+| IC1 pin 7 (VCCB) | GND | no | Good: pin 7 is not shorted, 3.3 V can be added safely |
+| IC1 pin 7 | 3V3 pin of the SWD header (MCU 3.3 V) | no | The 3.3 V connection to VCCB is broken / missing |
+| Empty footprint above IC1, pad "P7" | IC1 pin 7 | yes | This footprint is in the VCCB supply path |
+| Empty footprint, other pad "PX" | 3V3 header pin | no | PX is not directly on the MCU 3.3 V rail |
+
+Result: the empty footprint (part not fitted) feeds VCCB of IC1. Its other
+pad PX is not on the 3V3 header net, so PX may be on another rail (for example
+"3.3VL" through the unknown series part, or a switched rail) or on nothing.
+A beep tester also stays silent through a resistor of more than a few tens
+of ohms, so PX could still reach 3.3 V through a part.
+
+Next (T7 part 2): battery back on, modem on (`b`), measure the voltage on PX
+and P7. If PX = 3.2-3.3 V: bridge the footprint (0 R or solder bridge). If
+not: thin wire from P7 to the 3V3 header pin instead. VCCB must be the MCU's
+3.3 V in any case, because the B side talks to PA2/PA3.
