@@ -19,7 +19,8 @@ Result words: **PASS** = works as expected, **FAIL** = does not work,
 | T2 | 2026-10-31 | Boot log of the owner's working LIS2DS12 firmware on Rev11 (8 min, partial copy) | FAIL: modem does not answer `AT`; no MCU resets seen; battery 3.87 V |
 | T3 | 2026-10-31 | Photos (3) and BOM review | Done, 1 open item (J1 GPS connector empty in photos) |
 | T4 | 2026-10-31 | `modem_power_test.bin` v0.1: modem power, power key polarity, UART line, baud/swap scan, GPS | FAIL: modem seems to start (PA3 becomes driven), but no byte at any baud, normal or swapped; GPS silent |
-| T5 | 2026-10-31 | Multimeter on IC1 (TXB0102) pins, modem off / on / PA2 low, with `modem_power_test.bin` v0.2 | OPEN |
+| T5 | 2026-10-31 | Multimeter on IC1 (TXB0102) pins, modem off / on, with `modem_power_test.bin` v0.2 | FAIL: both supply pins and OE read 0 V; the level shifter is unpowered |
+| T6 | 2026-10-31 | Re-check IC1 middle pins at the pads; check the empty footprint above IC1; owner checks the design | OPEN |
 
 ## T0: Already known before this log (from the handoff)
 
@@ -278,3 +279,63 @@ detected" (ST-LINK not connected to the Mac). The board was running anyway,
 and the automatic test `t` ran a second time with the same result as T4: PA3
 floating after PA10 on, driven HIGH after the method A pulse, no answer at
 any baud rate. **T4 is repeatable.**
+
+## T5 result: IC1 pin voltages (2026-10-31)
+
+8-pin chip on the top side, right of the N706B (close-up photo from the
+owner). Measured against GND, `o` = modem off, `b` = modem on (v0.2):
+
+| Pin | o (off) | b (on) |
+|---|---|---|
+| 1 | 3.19 V | 3.3 V |
+| 2 | 0 | 0 |
+| 3 | 0 | 0 |
+| 4 | 0.28 V | 1.8 V |
+| 5 | 0.28 V | 1.8 V |
+| 6 | 0 | 0 |
+| 7 | 0 | 0 |
+| 8 | 3.3 V | 3.3 V |
+
+TXB0102 in VSSOP-8 (DCU) has its four data pins on the corners (B2 and B1
+facing each other at one end, A2 and A1 facing each other at the other end)
+and GND, VCCA, OE, VCCB on the four middle pins. This holds whichever corner
+was counted as pin 1, so the conclusion does not depend on the numbering:
+
+* Pins 1 + 8 = **B side (MCU, 3.3 V)**: PA2 (MCU TX, idles HIGH) and PA3
+  (MCU RX, held up by the STM32 internal pull-up: 3.19 V with modem off).
+  As expected.
+* Pins 4 + 5 = **A side (modem)**: 1.8 V with the modem on, ~0.28 V off.
+  The modem's UART lines idle HIGH at 1.8 V, so **the modem is on and its
+  UART is at 1.8 V**. This also confirms a level shifter is needed.
+* Pins 2, 3, 6, 7 = **GND, VCCA, OE, VCCB: all 0 V, modem off and on.** One
+  of them should be 0 V (GND). The other three should be VCCB = 3.3 V,
+  VCCA = 1.8 V (modem on) and OE = high.
+
+Result: **FAIL. The level shifter has no supply and is not enabled, so no
+data can pass in either direction.** This explains T2 and T4 exactly: the
+modem starts, but never receives `AT` and its answers never reach the MCU.
+(TXB0102 data pins go high-impedance when unpowered, which is why pins 1/8
+and 4/5 still show the levels of the MCU and the modem.)
+
+Caveat: the middle pins are hard to probe at 0.5 mm pitch; four readings of
+exactly 0 V could also be a probe that did not touch. Re-check at the pads
+(T6).
+
+Close-up photo: just **above IC1, slightly left of centre, there seem to be
+two small round pads with no part between them** (an empty 0402 footprint?).
+The BOM lists three 0 R parts (R26, R27, R33). If that footprint is the
+0 R / link that feeds IC1's supply, it would explain the 0 V. Not confirmed:
+needs the design (owner) or a close look.
+
+## T6: Re-check and find the missing supply
+
+Status: OPEN. Asked the owner to:
+
+1. Re-measure pins 2, 3, 6, 7 with the modem on (`b`), probe on the solder
+   joint at the pad, not on the leg.
+2. Look at the spot above IC1 with a magnifier: empty footprint or not?
+   Measure both pads of it with the modem on.
+3. Check in the DesignSpark design which nets feed IC1 VCCA, VCCB and OE,
+   and which part is at that footprint. Compare with an old working board.
+4. **Do not bridge anything yet**: VCCA must get the modem's 1.8 V (VDD_EXT),
+   not 3.3 V, or the modem's UART pins may be damaged.
