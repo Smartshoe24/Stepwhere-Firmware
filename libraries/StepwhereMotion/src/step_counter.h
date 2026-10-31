@@ -59,6 +59,8 @@ typedef struct {
     uint16_t max_stride_ms;    /* longest time between strides (else walk ends)  */
     uint8_t  rhythm_pct;       /* allowed change between intervals while starting */
     uint8_t  confirm_strides;  /* regular strides needed before counting starts  */
+    uint8_t  resume_strides;   /* ... if a walk ended less than resume_ms ago    */
+    uint16_t resume_ms;        /* (turning, short stop): 0 = off                 */
     uint8_t  steps_per_stride; /* 2: sensor in one shoe only                     */
 } step_counter_config_t;
 
@@ -81,7 +83,7 @@ typedef struct {
     step_counter_config_t cfg;
     uint8_t  gravity_shift;
     uint8_t  smooth_n;
-    uint32_t merge_gap, min_burst, max_burst, min_still, min_stride, max_stride;
+    uint32_t merge_gap, min_burst, max_burst, min_still, min_stride, max_stride, resume;
 
     /* signal path */
     int32_t  gravity_q8;       /* |gravity| estimate, mg * 256 (starts at 1 g)   */
@@ -108,6 +110,8 @@ typedef struct {
     bool     have_last;
     uint32_t last_stride;      /* sample index of the last accepted candidate    */
     uint32_t last_interval;    /* samples between the last two candidates        */
+    bool     walked;           /* a walk has been counted before                 */
+    uint32_t walk_end;         /* sample index of the last stride of that walk   */
 
     /* results */
     uint32_t strides;

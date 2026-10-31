@@ -53,7 +53,7 @@
 #define FLASH_HOLD PB12
 #define LDO_EN     PA10  // GSM/GPS LDO, kept off
 
-#define FW_NAME "lis2dh12_bringup v0.3"
+#define FW_NAME "lis2dh12_bringup v0.4"
 #define REC_HZ  50u
 #define SAMPLE_MS (1000u / REC_HZ)
 

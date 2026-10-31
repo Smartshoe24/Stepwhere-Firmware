@@ -30,7 +30,7 @@ typedef struct { const char *name; size_t off; int is8; } field_t;
 static const field_t k_fields[] = {
     F16(gravity_tau_ms), F16(smooth_ms), F16(low_mg), F16(high_mg), F16(merge_gap_ms),
     F16(min_burst_ms), F16(max_burst_ms), F16(min_energy_gms), F16(min_still_ms),
-    F16(min_stride_ms), F16(max_stride_ms), F8(rhythm_pct), F8(confirm_strides), F8(steps_per_stride),
+    F16(min_stride_ms), F16(max_stride_ms), F8(rhythm_pct), F8(confirm_strides), F8(resume_strides), F16(resume_ms), F8(steps_per_stride),
 };
 
 static int set_field(step_counter_config_t *c, const char *arg)

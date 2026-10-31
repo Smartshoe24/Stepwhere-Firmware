@@ -21,6 +21,8 @@ void step_counter_default_config(step_counter_config_t *cfg, uint16_t sample_hz)
     cfg->max_stride_ms = 2000;    /*  60 steps/min: slower than a slow walk       */
     cfg->rhythm_pct = 40;
     cfg->confirm_strides = 4;     /* = 8 steps before counting starts             */
+    cfg->resume_strides = 2;      /* after turning / a short stop in a walk       */
+    cfg->resume_ms = 10000;
     cfg->steps_per_stride = 2;
 }
 
@@ -50,7 +52,8 @@ bool step_counter_init(step_counter_t *sc, const step_counter_config_t *cfg)
 {
     if (!sc || !cfg || cfg->sample_hz == 0 || cfg->sample_hz > 1000 || cfg->confirm_strides == 0 ||
         cfg->min_stride_ms >= cfg->max_stride_ms || cfg->min_burst_ms > cfg->max_burst_ms ||
-        cfg->low_mg > cfg->high_mg || cfg->steps_per_stride == 0)
+        cfg->low_mg > cfg->high_mg || cfg->steps_per_stride == 0 ||
+        (cfg->resume_ms && (cfg->resume_strides == 0 || cfg->resume_strides > cfg->confirm_strides)))
         return false;
 
     memset(sc, 0, sizeof(*sc));
@@ -73,6 +76,7 @@ bool step_counter_init(step_counter_t *sc, const step_counter_config_t *cfg)
     sc->min_still = ms_to_samples(cfg->min_still_ms, cfg->sample_hz);
     sc->min_stride = ms_to_samples(cfg->min_stride_ms, cfg->sample_hz);
     sc->max_stride = ms_to_samples(cfg->max_stride_ms, cfg->sample_hz);
+    sc->resume = cfg->resume_ms ? ms_to_samples(cfg->resume_ms, cfg->sample_hz) : 0;
     sc->state = STEP_STATE_IDLE;
     return true;
 }
@@ -89,6 +93,8 @@ void step_counter_break(step_counter_t *sc)
 
 static uint32_t count(step_counter_t *sc, uint32_t strides)
 {
+    sc->walked = true;
+    sc->walk_end = sc->last_stride;
     sc->strides += strides;
     uint32_t steps = strides * sc->cfg.steps_per_stride;
     sc->steps += steps;
@@ -116,9 +122,15 @@ static uint32_t on_burst(step_counter_t *sc)
     sc->last_reject = why;
     if (why != STEP_REJECT_NONE) {
         sc->rejected++;                                       /* not a walking stride */
-        uint32_t still = sc->still_run;
-        step_counter_break(sc);
-        sc->still_run = still;
+        /* Short or weak bursts are ignored: real walking has one between
+         * strides (push-off of the same foot, first recordings 2026-10-31),
+         * so they must not reset the rhythm. Long continuous motion
+         * (shaking, vibration) or motion with no stance does end a walk. */
+        if (why == STEP_REJECT_LONG || why == STEP_REJECT_NOT_STILL) {
+            uint32_t still = sc->still_run;
+            step_counter_break(sc);
+            sc->still_run = still;
+        }
         return 0;
     }
 
@@ -163,7 +175,11 @@ static uint32_t on_burst(step_counter_t *sc)
     sc->last_interval = iv;
     sc->last_stride = t;
 
-    if (sc->pending >= sc->cfg.confirm_strides) {
+    /* Right after a walk (turning around, a short stop) fewer regular
+     * strides are needed to carry on counting. */
+    uint32_t need = sc->cfg.confirm_strides;
+    if (sc->resume && sc->walked && (t - sc->walk_end) <= sc->resume) need = sc->cfg.resume_strides;
+    if (sc->pending >= need) {
         uint32_t n = sc->pending;
         sc->pending = 0;
         sc->state = STEP_STATE_WALKING;

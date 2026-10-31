@@ -37,3 +37,13 @@ ${CC:-cc} $CFLAGS -Wno-conversion "$HOST/sim_dump.c" "$HOST/motion_sim.c" -lm -o
 "$OUT/step_replay" --decimate 2 "$OUT/walk50.csv" | tail -1 | grep -q "TOTAL 100 steps" \
     || { echo "step_replay smoke test FAILED"; exit 1; }
 echo "built $OUT/step_replay and $OUT/sim_dump (smoke test passed)"
+
+echo "== Real recordings"
+# Expected step ranges for recordings with a known result (recordings/*/README.md).
+check_rec() {   # file min max
+    n=$("$OUT/step_replay" --decimate 2 "$ROOT/$1" | tail -1 | awk '{print $2}')
+    if [ "$n" -ge "$2" ] && [ "$n" -le "$3" ]; then echo "  ok   $1: $n steps ($2..$3)"
+    else echo "  FAIL $1: $n steps, expected $2..$3"; exit 1; fi
+}
+check_rec recordings/2026-10-31/walk1_s1_still.csv 0 0
+check_rec recordings/2026-10-31/walk1_s2_walk.csv 110 124
