@@ -19,8 +19,9 @@ Result words: **PASS** = works as expected, **FAIL** = does not work,
 | T2 | 2026-10-31 | Boot log of the owner's working LIS2DS12 firmware on Rev11 (8 min, partial copy) | FAIL: modem does not answer `AT`; no MCU resets seen; battery 3.87 V |
 | T3 | 2026-10-31 | Photos (3) and BOM review | Done, 1 open item (J1 GPS connector empty in photos) |
 | T4 | 2026-10-31 | `modem_power_test.bin` v0.1: modem power, power key polarity, UART line, baud/swap scan, GPS | FAIL: modem seems to start (PA3 becomes driven), but no byte at any baud, normal or swapped; GPS silent |
-| T5 | 2026-10-31 | Multimeter on IC1 (TXB0102) pins, modem off / on, with `modem_power_test.bin` v0.2 | FAIL: both supply pins and OE read 0 V; the level shifter is unpowered |
-| T6 | 2026-10-31 | Re-check IC1 middle pins at the pads; check the empty footprint above IC1; owner checks the design | OPEN |
+| T5 | 2026-10-31 | Multimeter on IC1 (TXB0102) pins, modem off / on, with `modem_power_test.bin` v0.2 | FAIL: middle pins read 0 V (partly a probing miss, see T6) |
+| T6 | 2026-10-31 | Re-check IC1 middle pins at the pads (modem on) | **FAIL: VCCB (pin 7) = 0 V.** VCCA 1.8 V, OE 1.8 V, GND 0 V are correct. Root cause of "no AT answer" |
+| T7 | 2026-10-31 | Battery off: continuity checks around IC1 pin 7, then give VCCB 3.3 V, re-run `t` | OPEN |
 
 ## T0: Already known before this log (from the handoff)
 
@@ -339,3 +340,52 @@ Status: OPEN. Asked the owner to:
    and which part is at that footprint. Compare with an old working board.
 4. **Do not bridge anything yet**: VCCA must get the modem's 1.8 V (VDD_EXT),
    not 3.3 V, or the modem's UART pins may be damaged.
+
+## T6 result: IC1 middle pins re-measured (2026-10-31)
+
+Owner confirmed the part marking/type: **TXB0102DCUR**. Modem on (`b`),
+probe on the pads:
+
+| Pin | TXB0102 DCU function (TI pinout) | Measured | Expected | |
+|---|---|---|---|---|
+| 1 | B2 (MCU side data) | 3.3 V (T5) | 3.3 V idle | OK |
+| 2 | GND | 0 V | 0 V | OK |
+| 3 | VCCA (modem side supply) | 1.8 V | 1.8 V (modem VDD_EXT) | OK |
+| 4 | A2 (modem side data) | 1.8 V (T5) | 1.8 V idle | OK |
+| 5 | A1 (modem side data) | 1.8 V (T5) | 1.8 V idle | OK |
+| 6 | OE (enable) | 1.8 V | = VCCA | OK |
+| 7 | **VCCB (MCU side supply)** | **0 V** | **3.3 V** | **FAIL** |
+| 8 | B1 (MCU side data) | 3.3 V (T5) | 3.3 V idle | OK |
+
+The owner's pin numbering matches the TI pinout: the data pins, VCCA and OE
+all read the voltages they should.
+
+Result: **ROOT CAUSE FOUND (to be confirmed by the fix). VCCB of the level
+shifter IC1 has no 3.3 V.** The TXB0102 needs VCCA <= VCCB; with VCCB = 0 V
+it does not translate in either direction. So the modem starts (VDD_EXT 1.8 V
+powers VCCA and OE, which is why PA3 changed after the power-key pulse in
+T4), but `AT` never reaches it and nothing comes back.
+
+The 0 V in T5 on pins 3 and 6 was a probing miss; pins 2 and 7 were right.
+
+Open: why pin 7 has no 3.3 V. Candidates: a part not fitted (the empty
+footprint above IC1 in the close-up, maybe one of the 0 R parts R26 / R27 /
+R33), an open trace or via, a bad solder joint on pin 7, or pin 7 tied to GND
+by mistake in the Rev11 layout.
+
+## T7: Find the break, then give VCCB 3.3 V
+
+Status: OPEN, steps sent to the owner. Plan:
+
+1. Battery off (unsolder the red wire at BAT), so resistance / beep tests
+   are safe.
+2. Beep test: IC1 pin 7 to GND (must NOT beep; if it beeps, pin 7 is shorted
+   to GND: do not add 3.3 V). IC1 pin 7 to the 3V3 pin of the SWD header
+   (should beep; it will not, if the link is broken). Both pads of the empty
+   footprint above IC1 to pin 7 and to 3V3.
+3. Fix: fit the missing 0 R / solder bridge if the footprint is the link,
+   otherwise a thin wire from IC1 pin 7 to 3V3 (header pin or a nearby 3.3 V
+   pad). 3.3 V only on pin 7, never on pins 3 or 6 (1.8 V side).
+4. Battery back, flash `modem_power_test.bin`, press `t`. Expected:
+   `AT OK at 115200`, plus ATI / CPIN / CSQ / IMEI answers.
+5. Then the owner's LIS2DS12 firmware again (GSM + GPRS should come up).
