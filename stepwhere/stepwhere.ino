@@ -20,6 +20,7 @@
 #include <STM32_ISR_Timer.h>
 #include <HardwareSerial.h>
 #include <TinyGPSPlus.h>
+#include "accel_steps.h"  // LIS2DH12 + software step counter (libraries/StepwhereMotion)
 // #include "cert.h"
 
 // ─── Pin definitions ──────────────────────────────────────────────────────────
@@ -28,9 +29,9 @@
 #define DEBUG_EN
 #define I2C_SDA PA12
 #define I2C_SCL PA11
-#define LIS2DS12_SA0 PA1
-#define LIS2DS12_INT1 PB3
-#define LIS2DS12_INT2 PB4
+#define ACC_SA0 PA1    // LIS2DH12 SA0, driven HIGH -> I2C address 0x19
+#define ACC_INT1 PB3   // LIS2DH12 INT1 (not used yet)
+#define ACC_INT2 PB4   // LIS2DH12 INT2 (not used yet, for wake from sleep)
 
 #define ADC_PIN PB10       // External analog input (ADC_IN8)
 #define ADC_VREF_CH AVREF  // Internal Vref channel (STM32 built-in)
@@ -177,31 +178,6 @@ bool gpsNoFixTimerRunning = false;
 #define WAKE_MIN_DISTANCE_M 15.0
 #define HTTP_REQ_DELAY 3000UL  //5000UL  // 5sec
 
-//_____LIS2DS
-
-// LIS2DS12 Register Addresses
-#define LIS2DS12_ADDRESS 0x1D
-
-#define LIS2DS12_REG_CTRL1 0x20
-#define LIS2DS12_REG_CTRL2 0x21
-#define LIS2DS12_REG_CTRL3 0x22
-#define LIS2DS12_REG_CTRL4 0x23
-#define LIS2DS12_REG_CTRL5 0x24
-
-#define LIS2DS12_TAP_6D_THS 0x31
-#define LIS2DS12_REG_INT_DUR 0x32
-#define LIS2DS12_WAKE_UP_THS 0x33
-#define LIS2DS12_FUNC_CTRL 0x3F
-#define LIS2DS12_REG_SM_THS 0x34
-
-#define LIS2DS12_REG_STATUS 0x27
-#define LIS2DS12_REG_OUT_X_L 0x28
-#define LIS2DS12_REG_OUT_X_H 0x29
-#define LIS2DS12_REG_OUT_Y_L 0x2A
-#define LIS2DS12_REG_OUT_Y_H 0x2B
-#define LIS2DS12_REG_OUT_Z_L 0x2C
-#define LIS2DS12_REG_OUT_Z_H 0x2D
-
 //______ Variable
 
 // ─── Network / server config ─ edit before flashing ──────────────────────────
@@ -243,7 +219,7 @@ const char ROOT_CA[] = { 0 };
 #define HTTPS_AUTH_MODE 1                 // 0=no auth 1=server auth 2=mutual auth
 
 // ─── Version ────────────────────────────────────────────────────────────────
-#define APP_VERSION "v1.2"
+#define APP_VERSION "v1.2-lis2dh12"  // test build: LIS2DH12 + software steps, no OTA
 // ─── TinyGPS++ ────────────────────────────────────────────────────────────────
 TinyGPSPlus gps;
 
@@ -1853,6 +1829,9 @@ void oneminute_timer_callback() {
   INFO.println("+------------------------------+");
   INFO.print("Steps in last minute: ");
   INFO.println(g_steps.steps_this_min);
+  INFO.print("Steps total: ");
+  INFO.println(g_steps.steps_total);
+  accel_steps_print_status(INFO);
   INFO.println("+------------------------------+");
 
   // // ── Inactivity → flag sleep (loop() calls enter_sleep() safely) ───────────
@@ -1916,72 +1895,18 @@ void oneminute_timer_init() {
   DEBUG.println("[TIMER] one minute timer started (1 min interval).");
 }
 
-bool step_ready = false;
-byte checkLIS2DS12() {
-  byte error;
-  dev_i2c.beginTransmission(LIS2DS12_ADDRESS);
-  error = dev_i2c.endTransmission();
-  if (error == 0) {
-    DEBUG.println("LIS2DS12 found at 0x1D");
-    step_ready = true;
-  } else {
-    DEBUG.println("LIS2DS12 not found !!!");
-    step_ready = false;
-  }
-  return error;
-}
-
-void configureLIS2DS12() {
-  // Initialize the LIS2DS12 accelerometer
-  writeRegister(LIS2DS12_REG_CTRL1, 0x60);  // Enable accelerometer, 14Bits, 400Hz output data, +/-2g full scale
-  writeRegister(LIS2DS12_FUNC_CTRL, 0x01);  // Enable Bit1(significant motion)|Bit0(Step counter)
-  writeRegister(LIS2DS12_REG_CTRL2, 0x00);
-  writeRegister(LIS2DS12_REG_CTRL3, 0x38);  // Enable tap detection on X, Y, Z axis
-  writeRegister(LIS2DS12_REG_CTRL4, 0x08);  // Double-tap interrupt driven to INT1 pin
-  writeRegister(LIS2DS12_REG_CTRL5, 0x0C);  // Significant motion interrupt driven to INT2 pin
-
-  writeRegister(LIS2DS12_TAP_6D_THS, 0x0C);   // Set tap threshold
-  writeRegister(LIS2DS12_REG_INT_DUR, 0x7F);  // Set duration, quiet and shock time windows
-  writeRegister(LIS2DS12_WAKE_UP_THS, 0x80);  //Single & double-tap enabled (SINGLE_DOUBLE_TAP = 1)
-
-  // Enable click/double-click detection (optional)
-  //writeRegister(0x38, 0x40); // Enable interrupt generation on click or double click
-  //writeRegister(0x39, 0x0A); // Set threshold for click detection
-}
-
-void writeRegister(byte reg, byte value) {
-  dev_i2c.beginTransmission(LIS2DS12_ADDRESS);
-  dev_i2c.write(reg);
-  dev_i2c.write(value);
-  dev_i2c.endTransmission();
-}
-
-void readAccelerometerData(int16_t &x, int16_t &y, int16_t &z) {
-  dev_i2c.beginTransmission(LIS2DS12_ADDRESS);
-  dev_i2c.write(LIS2DS12_REG_OUT_X_L | 0x80);  // Auto-increment register address
-  dev_i2c.endTransmission(false);
-  dev_i2c.requestFrom(LIS2DS12_ADDRESS, 6);
-  //while (dev_i2c.available() < 6);
-  x = dev_i2c.read() | (dev_i2c.read() << 8);
-  y = dev_i2c.read() | (dev_i2c.read() << 8);
-  z = dev_i2c.read() | (dev_i2c.read() << 8);
-  //* 0.061 for 2G
-}
-
-void LIS2DS12_INT1_ISR() {
-  //DEBUG.println("Double Tap Detected");
-}
-
-// isr_step_detected
-// volatile uint32_t wake_count = 0;
-void LIS2DS12_INT2_ISR() {
-  // DEBUG.println("Step Detected");
-  g_steps.step_isr_count++;
-  wake_count++;
+// ─── Accelerometer: LIS2DH12 with software step counter ─────────────────────
+// The old sensor counted steps in hardware and pulsed INT2 once per step. The
+// LIS2DH12 has no pedometer: accel_steps.cpp reads its FIFO from a timer
+// interrupt and runs the step counter (libraries/StepwhereMotion). It calls
+// this function with the steps it found, in interrupt context, and it does
+// what the old INT2 ISR did for each step.
+void accel_steps_on_steps(uint32_t steps) {
+  g_steps.step_isr_count += steps;
+  wake_count += steps;
   if (g_steps.sleep_mode_on && wake_count >= MIN_STEPS) {
     g_steps.sleep_mode_on = false;
     g_steps.send_sleep_data = false;
-    g_steps.last_active_ms = millis();
     g_steps.sleep_minute_count = 0;
     wake_count = 0;
     // loop() sees sleep_mode_on = false and skips enter_sleep()
@@ -1990,18 +1915,12 @@ void LIS2DS12_INT2_ISR() {
   g_steps.active = true;
 }
 
-void lis2ds_init() {
-  pinMode(LIS2DS12_SA0, OUTPUT);
-  pinMode(LIS2DS12_INT1, INPUT_PULLUP);
-  pinMode(LIS2DS12_INT2, INPUT_PULLUP);
-  digitalWrite(LIS2DS12_SA0, HIGH);  //0x1D
-
-  dev_i2c.begin();
-  configureLIS2DS12();
-  checkLIS2DS12();
-
-  attachInterrupt(digitalPinToInterrupt(LIS2DS12_INT1), LIS2DS12_INT1_ISR, FALLING);
-  attachInterrupt(digitalPinToInterrupt(LIS2DS12_INT2), LIS2DS12_INT2_ISR, FALLING);
+void lis2dh_init() {
+  if (accel_steps_begin(dev_i2c, ACC_SA0)) {
+    DEBUG.println("[ACCEL] LIS2DH12 found at 0x19, step counter running.");
+  } else {
+    ERR.println("[ACCEL] LIS2DH12 not found !!! (retrying every 5 s)");
+  }
 }
 
 //=============================================================================
@@ -2188,7 +2107,7 @@ void setup() {
   // Initialise RTC-based low power (required before LowPower.deepSleep)
   // LowPower.begin();
 
-  lis2ds_init();
+  lis2dh_init();
   g_steps.last_active_ms = millis();
   oneminute_timer_init();
 
