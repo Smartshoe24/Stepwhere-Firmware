@@ -93,6 +93,14 @@ int main(int argc, char **argv)
         if (line[0] == '#') {
             const char *p = strstr(line, "odr=");
             if (p && !hz) hz = atoi(p + 4);
+            if (started && (!strncmp(line, "#GAP", 4) || !strncmp(line, "#OVERRUN", 8))) {
+                step_counter_break(&sc);       /* samples missing: restart walk detection */
+                acc[0] = acc[1] = acc[2] = 0;
+                nacc = 0;
+                continue;
+            }
+            p = strstr(line, " steps=");
+            if (!strncmp(line, "#end session", 12) && p) printf("(board counted %d steps)\n", atoi(p + 7));
             if (!strncmp(line, "#MARK", 5)) {
                 if (started) printf("%-24s %6u steps\n", mark, (unsigned)since_mark);
                 since_mark = 0;

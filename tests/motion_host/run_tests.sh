@@ -18,6 +18,12 @@ echo "== LIS2DH12 driver"
 ${CC:-cc} $CFLAGS "$HOST/test_lis2dh12.c" "$HOST/fake_lis2dh12.c" "$SRC/lis2dh12.c" -o "$OUT/test_lis2dh12"
 "$OUT/test_lis2dh12"
 
+echo "== Motion log in external flash"
+OTA="$ROOT/libraries/StepwhereOTA/src"
+${CC:-cc} $CFLAGS -Wno-conversion -I"$OTA" -I"$ROOT/tests/host" "$HOST/test_motion_log.c" "$SRC/motion_log.c" \
+    "$OTA/w25q.c" "$ROOT/tests/host/fake_w25q.c" -o "$OUT/test_motion_log"
+"$OUT/test_motion_log"
+
 echo "== Step counter"
 ${CC:-cc} $CFLAGS -Wno-conversion "$HOST/test_step_counter.c" "$HOST/motion_sim.c" "$SRC/step_counter.c" \
     -lm -o "$OUT/test_step_counter"
