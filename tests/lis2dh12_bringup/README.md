@@ -1,10 +1,11 @@
 # LIS2DH12 bring-up and step recordings
 
-`lis2dh12_bringup.ino` checks the accelerometer (IC7) on a GSM PCB and records
-raw motion data so the step counter can be tuned on real walking.
+`lis2dh12_bringup.ino` checks the accelerometer (IC7) on a GSM PCB and
+records motion data into the board's own W25Q128 flash, so the board can be
+in the shoe **without a cable**. You download the recordings afterwards.
 
 Prebuilt: [`prebuilt/lis2dh12_bringup.bin`](../../prebuilt/lis2dh12_bringup.bin)
-(standalone, linked at 0x08000000).
+(v0.2, standalone, linked at 0x08000000).
 
 ## 1. Flash
 
@@ -15,53 +16,51 @@ STM32_Programmer_CLI -c port=SWD -w prebuilt/lis2dh12_bringup.bin 0x08000000 -v 
 ```
 
 This replaces the bootloader and the app on that board. To go back to normal
-firmware, flash the factory image (bootloader + app) again.
+firmware, flash the factory image (bootloader + app) again. The OTA areas of
+the external flash are not touched (the log uses 0x070000-0xFF0000).
 
-## 2. Board check
+## 2. Board check (cable connected, board lying still, on battery)
 
 ```sh
 python3 tools/ota_uart.py monitor --port /dev/cu.usbserial-0001
 ```
 
-Let the board lie still. After reset it prints:
+Press reset (or power-cycle). It prints:
 
 ```
-=== Stepwhere LIS2DH12 board check (lis2dh12_bringup v0.1) ===
+=== Stepwhere LIS2DH12 board check (lis2dh12_bringup v0.2) ===
 I2C devices: 0x19
 [PASS] I2C scan finds a device
-[PASS] WHO_AM_I = 0x33 at 0x19 - 0x19 (PA1 high): answers 0x33
+[PASS] WHO_AM_I = 0x33 at 0x19 - ...
 [PASS] SA0 follows PA1 (0x18 when low) - ...
 [PASS] configure 50 Hz, FIFO, INT1 - OK
-[PASS] FIFO delivers samples - 100 samples in 2 s (expect ~100)
+[PASS] FIFO delivers samples - ...
 [PASS] |a| at rest 900..1100 mg - ...
 [PASS] INT1 watermark interrupt - ...
-       Keep still 2 s ...
-       Now MOVE or tap the board (10 s) ...
-[PASS] INT2 motion interrupt - ...
-[PASS] INT2 quiet when still
+[PASS] external flash for the log - W25Q128 ID EF 4018, log OK
 RESULT: ALL CHECKS PASSED
+#RECORDING session 1 to flash. You can unplug the cable now.
+#info RECORDING, session 1, log 0/62720 pages (0.0%), 13 h 56 min left, steps 0
 ```
 
-Move or tap the board when it asks. Send the whole output, PASS or FAIL.
-`t` runs the check again. Quit the monitor (Ctrl-C) before recording: the
-recorder needs the port.
+**First time on each board**, erase the log area once: press `E`, then `y`
+(1-8 minutes). Then press `t`, then `y`, for the full check. It also tests
+INT2: move or tap the board when it asks. Send the whole output, PASS or FAIL.
 
-## 3. Recordings
+## 3. Recording in the shoe (no cable)
 
-The board must be **in the right shoe, in its final position in the heel**,
-on battery, with the USB-serial cable to a laptop that the walker carries (or
-a long cable). Count steps aloud or with a clicker.
+* **Every power-up or reset starts a new session** and recording begins
+  about 3 s after the board check.
+* The board records the whole time it has power: 50 Hz, about 14 hours of
+  space. The battery must be charged. Without GSM/GPS it lasts many hours.
+* Unplug the cable (TX/RX/GND), then put the board in the right shoe in its
+  final position.
 
-```sh
-pip3 install pyserial
-python3 tools/record_steps.py --port /dev/cu.usbserial-0001 --label walk100
-```
-
-Press **Enter** to drop a marker: once just before the first step and once
-after the last. Ctrl-C stops. Files go to `recordings/`. Write the real step
-count in the label or tell us.
-
-Please record (each with markers around the activity):
+Write down what you do, with times from a phone stopwatch started when you
+unplug the cable. If you can power-cycle the board (battery connector),
+start a new session for each activity. That makes the files easiest to use.
+Either way, **stand still for 10 s before and after each activity**: the
+still parts separate the activities in the data.
 
 | Label | What | Real steps |
 |---|---|---|
@@ -77,16 +76,53 @@ Please record (each with markers around the activity):
 | `sit_stomp` | sitting, lifting the heel and stomping, 2 min | 0 |
 | `car` / `bus` / `bike` | 10 min ride, shoe on the foot | 0 |
 | `shake` | shaking the shoe by hand, 1 min | 0 |
+| `school_day` | a normal day at school, if possible | (the step count from the old device or a phone, if any) |
 
-Upload the CSV files to the repo (folder `recordings/`) or send them.
+Example notes: `0:30-1:40 walk100 (100) | 2:00-5:00 sit_taps (0) | ...`
 
-The board also prints `#steps N` from the on-board counter while recording,
-so you can see roughly how it does. Real tuning happens on the PC:
+## 4. Download
+
+Take the board out, connect the cable, then run (not at the same time as the monitor):
+
+```sh
+pip3 install pyserial
+python3 tools/record_steps.py dump --port /dev/cu.usbserial-0001 --label day1
+```
+
+You get one file per session in `recordings/`, and the board's step count
+for each session:
+
+```
+  recordings/20261031_101500_day1_s1.csv:  42.3 min, 126900 samples, 0 gaps, board counted 214 steps
+```
+
+Downloading takes about 5 minutes per hour of recording. Add `--erase` to
+clear the board after a complete download. Then the board starts a new
+session and records again. Upload the CSV files plus your notes (folder
+`recordings/` in the repo, or send them).
+
+## 5. Keys (in the monitor)
+
+| Key | What |
+|---|---|
+| `i` | info: session, space used, live step count |
+| `d` | stop recording and download (use `record_steps.py dump` instead to save files) |
+| `n` | start a new session |
+| `x` | stop recording |
+| `e` / `E` | erase the recorded sessions / the whole log area |
+| `t` | full board check, including INT2 |
+| `r` | live CSV over the cable (`record_steps.py live`), `m` marker, `s` stop |
+| `h` | help |
+
+While it records, and for `e`/`E`, the board asks `send y to confirm`.
+Noise on an unplugged cable therefore cannot stop a recording or delete it.
+
+## Tuning on the PC
 
 ```sh
 sh tests/motion_host/run_tests.sh                     # builds step_replay
-tests/motion_host/build/step_replay --decimate 2 -v recordings/xxx_walk100.csv
-tests/motion_host/build/step_replay --decimate 2 --set high_mg=500 recordings/xxx_sit_taps.csv
+tests/motion_host/build/step_replay --decimate 2 -v recordings/xxx_s1.csv
+tests/motion_host/build/step_replay --decimate 2 --set high_mg=500 recordings/xxx_s1.csv
 ```
 
 ## Build from source
@@ -96,5 +132,5 @@ arduino-cli compile --fqbn STMicroelectronics:stm32:GenG0:pnum=GENERIC_G070CBTX 
     --libraries libraries --output-dir build/bringup tests/lis2dh12_bringup
 ```
 
-STM32duino core 2.x (tested 2.12.0). Only the `StepwhereMotion` library from
-this repo is needed.
+STM32duino core 2.x (tested 2.12.0). Needs the `StepwhereMotion` and
+`StepwhereOTA` libraries from this repo.
