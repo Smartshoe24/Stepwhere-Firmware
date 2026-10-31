@@ -13,3 +13,7 @@ walk2: 44 clear strides + 5 turns with no clear swing = 49-50 strides. v0.5 coun
 the 4 turns inside the walk; the first stride and the turn before the walk is
 confirmed (~71-75 s) are still lost. Originally uploaded to the
 `Hardware--Stepwhere` branch as `20261031_131121_walk2_s1.csv`.
+| `sit1_walk100_taps_jiggle_walk102.csv` | 13:25-13:27 walk 100 (file ~65-185 s), sitting foot taps 13:27-13:30 (~185-380 s), sitting jiggling the shoe in the air 13:30-13:33 (~380-560 s), walk 102 13:33-13:35 (~560-700 s), still after | 100 / 0 / 0 / 102 | v0.5 board: 192 total; per part 94 / 0 / 0 / 98 |
+
+The jiggle part has 7 bursts that pass the single-stride checks; only the
+rhythm check kept them at 0. Watch this margin when tuning.

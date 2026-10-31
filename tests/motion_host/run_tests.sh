@@ -48,3 +48,4 @@ check_rec() {   # file min max
 check_rec recordings/2026-10-31/walk1_s1_still.csv 0 0
 check_rec recordings/2026-10-31/walk1_s2_walk.csv 110 140    # truth "more than 100", not counted exactly
 check_rec recordings/2026-10-31/walk2_s1_walk100.csv 92 104  # truth 100 steps
+check_rec recordings/2026-10-31/sit1_walk100_taps_jiggle_walk102.csv 186 206  # truth 202, sitting parts 0
