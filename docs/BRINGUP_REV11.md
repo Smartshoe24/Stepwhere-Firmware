@@ -16,7 +16,8 @@ Result words: **PASS** = works as expected, **FAIL** = does not work,
 |---|---|---|---|
 | T0 | 2026-10-31 | Earlier tests with the bring-up firmware (from the handoff) | PASS for MCU, UART, accelerometer, flash; power connector is weak |
 | T1 | 2026-10-31 | Symptom report from the owner | OPEN |
-| T2 | 2026-10-31 | Full boot log of v1.2 firmware on Rev11, from power-up | OPEN |
+| T2 | 2026-10-31 | Full boot log of the owner's working LIS2DS12 firmware on Rev11, from power-up | OPEN |
+| T3 | 2026-10-31 | Photos (3) and BOM review | Done, 1 open item (J1 GPS connector empty in photos) |
 
 ## T0: Already known before this log (from the handoff)
 
@@ -69,3 +70,55 @@ Working ideas (to be checked, not proven):
 ## T2: Full boot log of v1.2 on Rev11
 
 Status: OPEN. Steps sent to the owner on 2026-10-31.
+
+Owner decided to run first **his own working firmware (LIS2DS12 version, the
+one used on the old boards)**, not `stepwhere_v1.2-lis2dh12.bin`. This is the
+exact case that fails, so it is the right first test. Expected on Rev11:
+`LIS2DS12 not found !!!` (harmless). GSM + GPS antennas are now connected.
+
+Because the battery is now soldered to the board, the log is started from a
+reset (flash with `-rst`, or a reset over SWD) instead of from plugging in the
+battery.
+
+## T3: Photos and BOM review (2026-10-31)
+
+Three photos (top side with N706B, bottom side twice) and the BOM
+"BOM-GSM Neoway" as CSV.
+
+Seen in the photos:
+
+* Modem marked **N706B-CN** (LTE module).
+* Battery wires are **soldered** to the BAT and GND pads. This replaces the
+  weak connector that caused the brown-out resets in T0. The 5V pad (charger
+  input) is not connected.
+* SIM card is inserted (photo 3). Some flux / dirt is visible on the SIM
+  holder pins (photo 2); not a problem for now.
+* **J1 (white 4-pin FFC connector, bottom side) is empty in all photos.** The
+  firmware reads GPS from a G7A module on USART3 (PB8/PB9). If the GPS module
+  connects through J1, GPS cannot work in this setup. Asked the owner.
+* Bottom-side 6-pin header is labelled (as far as readable) DIO, CLK, RST,
+  3V3, GND: the SWD (programming) header.
+* Two wires (black, brown) are soldered at the top edge near the modem.
+  Purpose not known yet (debug UART?). Asked the owner.
+* Photo resolution is too low to judge solder bridges on IC4 (LQFP48) or the
+  N706B pads. Nothing obviously wrong.
+
+From the BOM:
+
+* IC3 AP22811**A**: USB-style power switch, enable input is active HIGH,
+  2 A max ([Digi-Key AP22811AW5-7](https://www.digikey.com/en/products/detail/diodes-incorporated/AP22811AW5-7/6602437),
+  [Diodes datasheet](https://www.mouser.com/datasheet/2/115/AP22811-2997717.pdf)).
+  Input 2.7-5.5 V, 0.6 ms soft-start, fault flag. This fits "PA10 HIGH
+  switches on the GSM/GPS supply". Not confirmed on the board.
+* D3 PZ3D4V2H: 5.1 V zener, matches the BOM text
+  ([datasheet](https://hetpro-store.com/PDFs/PZ3D4V2H.pdf)).
+* Largest capacitors are 10 uF (C7, C13, C16, C21, C23). There is no large
+  reservoir capacitor (around 100 uF or more) on the BOM. LTE modules draw
+  short current bursts during network registration, and a small reservoir
+  makes the supply dip. Idea for later, not a finding: compare with the old
+  boards.
+* IC7 line still describes the LIS2DS12 (1.62-1.98 V); LIS2DH12 is fitted.
+
+Open questions to the owner: what is on J1 (GPS?), what are the black/brown
+wires, which modem did the old boards use (N706 or N706B-CN), same reservoir
+capacitors on the old boards?
