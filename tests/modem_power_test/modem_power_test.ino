@@ -18,13 +18,17 @@
  * w = listen 15 s, g = GPS listen 5 s, m = AT pass-through (~~~ leaves),
  * i = pin states, r = reset, h = help.
  *
+ * Multimeter states (v0.2): o = modem off, b = modem on (method B) and stay on,
+ * 1 / 0 = hold PA2 (MCU TX -> modem RX) HIGH / LOW as a plain pin,
+ * u = PA2 back to UART.
+ *
  * Pin assumptions (from stepwhere.ino): PA10 = GSM/GPS power enable,
  * PB13 = PWRKEY (polarity unknown on Rev11, both are tried),
  * USART2 PA2 TX / PA3 RX = N706B, 115200.
  */
 #include <HardwareSerial.h>
 
-#define VERSION    "modem_power_test v0.1"
+#define VERSION    "modem_power_test v0.2"
 #define LDO_EN     PA10
 #define GSM_PWRKEY PB13
 #define GSM_TX_PIN PA2
@@ -345,6 +349,8 @@ static void help()
     SerialDBG.println(" a  send AT at 115200               w  listen to modem 15 s");
     SerialDBG.println(" g  listen to GPS 5 s               m  AT pass-through (~~~ leaves)");
     SerialDBG.println(" i  pin states                      r  reset   h  help");
+    SerialDBG.println(" o  modem OFF (measure)             b  modem ON, stays on (measure)");
+    SerialDBG.println(" 1  hold PA2 HIGH   0  hold PA2 LOW   u  PA2 back to UART");
 }
 
 void setup()
@@ -377,7 +383,8 @@ void setup()
 void loop()
 {
     if (!SerialDBG.available()) return;
-    switch (SerialDBG.read()) {
+    int c = SerialDBG.read();
+    switch (c) {
     case 't': run_test(); break;
     case 'l': set_ldo(!g_ldo); break;
     case 'k': set_key(!g_key); SerialDBG.print("  PB13 = "); SerialDBG.println(g_key ? "HIGH" : "LOW"); break;
@@ -394,6 +401,37 @@ void loop()
     }
     case 'm': pass_through(); break;
     case 'i': pin_info(); break;
+    case 'o':
+        SerialDBG.println("MEASURE STATE: modem OFF");
+        gsm_begin(115200, false);
+        all_off();
+        break;
+    case 'b':
+        SerialDBG.println("MEASURE STATE: modem ON (method B), wait 10 s ...");
+        gsm_begin(115200, false);
+        set_ldo(true);
+        delay(1000);
+        set_key(true);
+        delay(1200);
+        set_key(false);
+        delay(10000);
+        SerialDBG.print("  PA3 line: ");
+        SerialDBG.println(line_state());
+        SerialDBG.println("  modem ON, PA2 = UART idle (HIGH). Measure now.");
+        break;
+    case '1':
+    case '0':
+        /* PA2 (MCU TX -> modem RX) as a plain output, for the multimeter */
+        SerialGSM.end();
+        pinMode(GSM_TX_PIN, OUTPUT);
+        digitalWrite(GSM_TX_PIN, c == '1' ? HIGH : LOW);
+        SerialDBG.print("  PA2 held ");
+        SerialDBG.println(c == '1' ? "HIGH (3.3 V)" : "LOW (0 V)");
+        break;
+    case 'u':
+        gsm_begin(115200, false);
+        SerialDBG.println("  PA2 back to UART (idle HIGH)");
+        break;
     case 'r': NVIC_SystemReset(); break;
     case 'h': help(); break;
     default: break;

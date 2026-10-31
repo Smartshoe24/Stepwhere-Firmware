@@ -18,7 +18,8 @@ Result words: **PASS** = works as expected, **FAIL** = does not work,
 | T1 | 2026-10-31 | Symptom report from the owner | Done: "stuck at starting" = modem never answers AT (see T2) |
 | T2 | 2026-10-31 | Boot log of the owner's working LIS2DS12 firmware on Rev11 (8 min, partial copy) | FAIL: modem does not answer `AT`; no MCU resets seen; battery 3.87 V |
 | T3 | 2026-10-31 | Photos (3) and BOM review | Done, 1 open item (J1 GPS connector empty in photos) |
-| T4 | 2026-10-31 | `modem_power_test.bin`: modem power, power key polarity, UART line, baud/swap scan, GPS | OPEN |
+| T4 | 2026-10-31 | `modem_power_test.bin` v0.1: modem power, power key polarity, UART line, baud/swap scan, GPS | FAIL: modem seems to start (PA3 becomes driven), but no byte at any baud, normal or swapped; GPS silent |
+| T5 | 2026-10-31 | Multimeter on IC1 (TXB0102) pins, modem off / on / PA2 low, with `modem_power_test.bin` v0.2 | OPEN |
 
 ## T0: Already known before this log (from the handoff)
 
@@ -192,5 +193,58 @@ New test sketch `tests/modem_power_test/modem_power_test.ino`, prebuilt
 6. GPS: listen 5 s on USART3 (PB9 RX, 9600).
 
 Battery voltage is sampled during steps 3 and 5 to catch supply dips.
+
+Status: OPEN, steps sent to the owner.
+
+## T4 result (2026-10-31, 15:25)
+
+Full log: owner's `rev11-T4` file. Summary printed by the board:
+
+```
+modem_power_test v0.1
+Battery idle / lowest A / lowest B : 3.86 / 3.85 / 3.85 V
+PA3 power off      : floating (nobody drives it: modem/level shifter has no power)
+PA3 power on       : floating (nobody drives it: modem/level shifter has no power)
+PA3 after method A : driven HIGH (modem UART side is alive)
+PA3 after method B : driven HIGH (modem UART side is alive)
+Boot bytes A / B   : 0 / 0
+Method A           : no answer at any baud rate, normal or swapped
+Method B           : no answer at any baud rate, normal or swapped
+GPS                : 0 bytes in 5 s (GPS silent)
+```
+
+Result: **FAIL**, but it narrows the problem down.
+
+* PA3 (modem -> MCU line) is floating with PA10 on and **becomes driven HIGH
+  only after the power-key pulse**. A UART line idles HIGH, so something on
+  the modem side switches on after the pulse. The most likely explanation:
+  IC1 (TXB0102 level shifter) gets its low-voltage supply VCCA from the
+  modem's own 1.8 V output (VDD_EXT), which only exists while the modem runs.
+  So **the modem very probably powers up and starts**, with both pulse
+  polarities. Not proven until VCCA is measured (T5).
+* Still **zero bytes** in 2 x 15 s of listening and no answer to `AT` at 8
+  baud rates, normal and swapped. So the data path between MCU and modem
+  does not work, or the MCU is connected to a modem UART that does not speak
+  AT (debug / AUX UART instead of the main UART), or the modem does not finish
+  booting.
+* Battery (PB10) did not dip (3.86 -> 3.85 V). This only covers the battery
+  side; whether PB10 measures before or after the power switch is UNKNOWN.
+* GPS silent: matches J1 (GPS connector) being empty in the photos (T3).
+
+Next: find out where the signal stops, with a multimeter on IC1 (T5), and ask
+the owner (who designed the board in DesignSpark, see the Rev10 plot report
+path) how the modem UART is routed on Rev11.
+
+## T5: Multimeter on IC1 (TXB0102)
+
+`modem_power_test.bin` v0.2 adds measuring states: `o` modem off, `b` modem on
+and stays on, `0` / `1` hold PA2 (MCU TX) LOW / HIGH as a plain pin, `u` PA2
+back to UART.
+
+TXB0102: VCCA (1.2-3.6 V, low side) must be <= VCCB (high side). Expected if
+the design is right: VCCB = 3.3 V always; VCCA = ~1.8 V only with the modem
+on; OE = same as VCCA (enabled); one A/B pair follows PA2 (`0`/`1`), the
+other pair idles HIGH (modem TX). The pin numbers are not assumed: the
+supply pins identify themselves by their voltages.
 
 Status: OPEN, steps sent to the owner.
