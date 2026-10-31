@@ -248,3 +248,27 @@ other pair idles HIGH (modem TX). The pin numbers are not assumed: the
 supply pins identify themselves by their voltages.
 
 Status: OPEN, steps sent to the owner.
+
+### T5 first reading (2026-10-31)
+
+Owner marked an 8-pin chip on the **top side**, right of the N706B, between
+the SOT-23 transistors, and wrote on the photo: **left side 3.31 V, right
+side 3.19 V**. Not yet known: which pin(s) were measured, in which test state
+(`o` / `b` / `0`), and whether this chip is IC1 (TXB0102) (marking not read
+yet).
+
+Notes:
+
+* One reading per side is not enough: every TXB0102 has a GND pin (0 V), so
+  not all four pins on one side can be at 3.2-3.3 V. Asked for all 8 pins.
+* If one supply pin is 3.31 V (VCCB, MCU side) and the other is 3.19 V
+  (VCCA, modem side), the modem side of the level shifter runs at ~3.2 V.
+  Neoway LTE modules usually have 1.8 V UART pins (to be checked in the N706B
+  hardware guide / the owner's design). A 3.2 V VCCA would mean the modem's
+  1.8 V "high" is not seen as high, and the modem RXD input gets 3.2 V.
+  **Idea only, not confirmed.**
+* It also does not fit T4 well: PA3 was floating with PA10 on before the
+  power-key pulse. With both supplies at ~3.3 V all the time, the TXB0102
+  would drive PA3 even then. So the measurement state matters.
+
+Asked for: per-pin readings in state `o` and `b`, chip marking, close-up photo.
