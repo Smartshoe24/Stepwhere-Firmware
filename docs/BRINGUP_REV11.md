@@ -410,16 +410,15 @@ and P7. If PX = 3.2-3.3 V: bridge the footprint (0 R or solder bridge). If
 not: thin wire from P7 to the 3V3 header pin instead. VCCB must be the MCU's
 3.3 V in any case, because the B side talks to PA2/PA3.
 
-Pad positions (owner, beep test, battery off): with the modem on the left as
-in the close-up photo, **P7 = left pad** of the empty footprint above IC1
-(beeps to IC1 pin 7), **PX = right pad**.
+Pad positions: first reported as P7 = left pad. **Corrected later** (owner's
+labelled photo): see "T7 part 3" below, **P7 = right pad, PX = left pad**.
 
 ### T7 part 2: pad voltages, modem on (`b`) (2026-10-31)
 
 | Point | Measured | Meaning |
 |---|---|---|
-| P7 (left pad = IC1 pin 7, VCCB) | 1.83 V | VCCB is **floating** (not connected to any supply). A floating supply pin drifts to about VCCA (1.8 V) through the chip's internal paths; the earlier 0 V reading was taken differently. Either way it is not 3.3 V |
-| PX (right pad) | 0.02 V | Not a supply rail. Bridging the footprint would not give VCCB 3.3 V |
+| Left pad (was called P7 here, is really PX) | 1.83 V | VCCB is **floating** (not connected to any supply). A floating supply pin drifts to about VCCA (1.8 V) through the chip's internal paths; the earlier 0 V reading was taken differently. Either way it is not 3.3 V |
+| Right pad (was called PX here, is really P7) | 0.02 V | Not a supply rail. Bridging the footprint would not give VCCB 3.3 V |
 
 Decision: **do not bridge the footprint.** Fix = a thin wire from **P7 to
 the 3V3 hole of the SWD header** (the same hole the ST-LINK 3.3 V uses; it is
@@ -431,3 +430,36 @@ footprint above IC1 is not fitted and its other pad is not on 3.3 V). VCCB
 also needs its own 100 nF decoupling capacitor to GND.
 
 Next: after the wire, check pin 7 = 3.3 V and pins 3 / 6 still 1.8 V, then run `t`.
+
+### T7 part 3: pads labelled on the photo, assembly drawing (2026-10-31)
+
+The owner labelled the photo (top side, modem on the left): above IC1, **PX =
+left pad, P7 = right pad** (nearer the board edge). "P7 gives a beep [to IC1
+pin 7] and PX is showing 1.8 V". This corrects the earlier labels, and the
+readings now agree with each other:
+
+| Pad | Beeps to IC1 pin 7 | Voltage, modem on |
+|---|---|---|
+| P7, right | yes | ~0 V (0.02 V; same as pin 7 in T6) |
+| PX, left | no | ~1.8 V (1.83 V) |
+
+Owner's top-side assembly drawing (uploaded as PDF image). It is drawn
+rotated 180 degrees against the photo (5V / BAT / GND pads are top right in
+the drawing, bottom left on the board). In the drawing **R38 sits directly
+below IC1**, which is directly above IC1 on the board: **the empty footprint
+is R38.** The owner says the BOM gives R38 = FRC0402J102 (1 kOhm). The BOM
+CSV sent earlier in this chat lists the 1 kOhm parts as R2, R37, R19, R35,
+R36, R9, R31: **R38 is not in it**, which would explain why the assembler
+left it empty.
+
+Is fitting R38 the fix? **No, not as it is.** R38 would connect VCCB to PX,
+and PX is a 1.8 V net (probably the modem's VDD_EXT, same as VCCA). VCCB
+would then be 1.8 V, through 1 kOhm. VCCB is the MCU side and must be the
+MCU's 3.3 V: with 1.8 V the MCU's 3.3 V TX would push into a 1.8 V input,
+and a 1.8 V "high" from the shifter is below the STM32 input-high threshold
+at 3.3 V supply. So the design value/net of R38 looks wrong too, not only the
+missing part. To be confirmed against the owner's design.
+
+Decision unchanged: **leave R38 empty**, wire **P7 (right pad) to 3V3**.
+Do not fit R38 and the wire together: that would join 3.3 V and 1.8 V
+through 1 kOhm.
