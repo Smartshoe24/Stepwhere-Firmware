@@ -409,3 +409,7 @@ Next (T7 part 2): battery back on, modem on (`b`), measure the voltage on PX
 and P7. If PX = 3.2-3.3 V: bridge the footprint (0 R or solder bridge). If
 not: thin wire from P7 to the 3V3 header pin instead. VCCB must be the MCU's
 3.3 V in any case, because the B side talks to PA2/PA3.
+
+Pad positions (owner, beep test, battery off): with the modem on the left as
+in the close-up photo, **P7 = left pad** of the empty footprint above IC1
+(beeps to IC1 pin 7), **PX = right pad**.
