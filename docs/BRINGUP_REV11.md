@@ -481,3 +481,22 @@ to GND, which makes no sense as a supply either. A beep tester can also beep
 briefly on a capacitor or a low-value path, and the 0402 pads are tiny.
 **The beep results conflict, so nothing gets soldered yet.** Next: resistance
 readings in ohms (battery off), named by position (left / right), not P7/PX.
+
+### T7 part 5: pad mapping confirmed by the owner (2026-10-31)
+
+Owner keeps his labels and confirms:
+
+| Owner's label | Position | Beeps to | Voltage, modem on | Net |
+|---|---|---|---|---|
+| **PX** | left | IC1 pin 7 | 1.8 V | **VCCB, floating** (drifts to ~VCCA) |
+| **P7** | right | GND | ~0 V (0.02-0.2 V) | **GND** |
+
+So R38 (1 kOhm, not fitted) sits between IC1 VCCB and GND. Fitting it would
+only pull VCCB down; **there is no 3.3 V feed for VCCB anywhere in the Rev11
+layout.** Design error for Rev12: VCCB (IC1 pin 7) must connect to the MCU's
+3.3 V, with a 100 nF capacitor to GND (R38's footprint position could serve as
+that capacitor if R38 really goes to GND).
+
+Fix: wire from **PX (left pad)** to the **3V3 hole of the SWD header**. Leave
+R38 empty. Safety check after soldering, battery still off: **3V3 to GND must
+not beep** (catches a wire on the wrong pad or a solder bridge to P7).
