@@ -21,7 +21,8 @@ Result words: **PASS** = works as expected, **FAIL** = does not work,
 | T4 | 2026-10-31 | `modem_power_test.bin` v0.1: modem power, power key polarity, UART line, baud/swap scan, GPS | FAIL: modem seems to start (PA3 becomes driven), but no byte at any baud, normal or swapped; GPS silent |
 | T5 | 2026-10-31 | Multimeter on IC1 (TXB0102) pins, modem off / on, with `modem_power_test.bin` v0.2 | FAIL: middle pins read 0 V (partly a probing miss, see T6) |
 | T6 | 2026-10-31 | Re-check IC1 middle pins at the pads (modem on) | **FAIL: VCCB (pin 7) = 0 V.** VCCA 1.8 V, OE 1.8 V, GND 0 V are correct. Root cause of "no AT answer" |
-| T7 | 2026-10-31 | Battery off: continuity checks around IC1 pin 7, then give VCCB 3.3 V, re-run `t` | Part 1 done: empty footprint above IC1 feeds pin 7; its other pad is not on 3V3. Part 2 OPEN |
+| T7 | 2026-10-31 | Continuity and voltages around IC1 pin 7 / R38 | Done: R38 (empty) sits between VCCB and GND; no 3.3 V feed for VCCB found |
+| T8 | 2026-10-31 | Same measurements on an old working board (R38 also empty there) | OPEN |
 
 ## T0: Already known before this log (from the handoff)
 
@@ -500,3 +501,24 @@ that capacitor if R38 really goes to GND).
 Fix: wire from **PX (left pad)** to the **3V3 hole of the SWD header**. Leave
 R38 empty. Safety check after soldering, battery still off: **3V3 to GND must
 not beep** (catches a wire on the wrong pad or a solder bridge to P7).
+
+## T8: compare with an old working board (2026-10-31)
+
+New information from the owner: an **old, working board also has R38
+empty** and works fine. So R38 is **not** the difference between the boards.
+(Fits T7: R38 goes from VCCB to GND, so it never was the 3.3 V feed.)
+
+Open question: how does VCCB (IC1 pin 7) get 3.3 V on the old board?
+
+* If old-board pin 7 = **3.3 V**: the old board has a 3.3 V path to VCCB
+  (trace, via or another part) that is broken or missing on Rev11. Then find
+  that path on the old board and compare (open trace, bad via, missing part,
+  or changed in the Rev11 layout).
+* If old-board pin 7 is also **~1.8 V / floating**: the old board works
+  without a proper VCCB, by luck, and Rev11 does not. Then the wire to 3V3 is
+  the right fix for both.
+
+Asked the owner to measure on the old board, while it runs and is connected
+to GSM: IC1 pins 3, 6, 7, and both R38 pads; and with the battery off: beep
+IC1 pin 7 to 3V3 and to GND. Plus: board revision marking, same modem
+(N706B-CN)? No soldering on Rev11 until this is known.
