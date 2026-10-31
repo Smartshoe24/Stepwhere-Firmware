@@ -463,3 +463,21 @@ missing part. To be confirmed against the owner's design.
 Decision unchanged: **leave R38 empty**, wire **P7 (right pad) to 3V3**.
 Do not fit R38 and the wire together: that would join 3.3 V and 1.8 V
 through 1 kOhm.
+
+### T7 part 4: beep re-check, battery off (2026-10-31)
+
+Owner: the pad labelled P7 in his photo (**right** pad) beeps to **GND**;
+the pad labelled PX (**left** pad) beeps to **IC1 pin 7** (both probe
+directions). This is the opposite of part 3 and agrees with the first report
+(left pad = pin 7). Readings so far, by position:
+
+| Pad above IC1 (R38) | Beeps to | Voltage, modem on |
+|---|---|---|
+| Left | IC1 pin 7 (part 1 and part 4); "no" in part 3 | 1.83 V (pin 7 floating) |
+| Right | GND (part 4) | 0.02 V |
+
+If the right pad really is GND, R38 (1 kOhm) would be a pull-down from VCCB
+to GND, which makes no sense as a supply either. A beep tester can also beep
+briefly on a capacitor or a low-value path, and the 0402 pads are tiny.
+**The beep results conflict, so nothing gets soldered yet.** Next: resistance
+readings in ohms (battery off), named by position (left / right), not P7/PX.
