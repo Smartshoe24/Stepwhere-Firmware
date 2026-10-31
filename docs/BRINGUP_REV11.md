@@ -272,3 +272,9 @@ Notes:
   would drive PA3 even then. So the measurement state matters.
 
 Asked for: per-pin readings in state `o` and `b`, chip marking, close-up photo.
+
+15:47 (screenshot): the reset over SWD failed with "No debug probe
+detected" (ST-LINK not connected to the Mac). The board was running anyway,
+and the automatic test `t` ran a second time with the same result as T4: PA3
+floating after PA10 on, driven HIGH after the method A pulse, no answer at
+any baud rate. **T4 is repeatable.**
