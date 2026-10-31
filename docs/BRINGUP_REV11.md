@@ -413,3 +413,21 @@ not: thin wire from P7 to the 3V3 header pin instead. VCCB must be the MCU's
 Pad positions (owner, beep test, battery off): with the modem on the left as
 in the close-up photo, **P7 = left pad** of the empty footprint above IC1
 (beeps to IC1 pin 7), **PX = right pad**.
+
+### T7 part 2: pad voltages, modem on (`b`) (2026-10-31)
+
+| Point | Measured | Meaning |
+|---|---|---|
+| P7 (left pad = IC1 pin 7, VCCB) | 1.83 V | VCCB is **floating** (not connected to any supply). A floating supply pin drifts to about VCCA (1.8 V) through the chip's internal paths; the earlier 0 V reading was taken differently. Either way it is not 3.3 V |
+| PX (right pad) | 0.02 V | Not a supply rail. Bridging the footprint would not give VCCB 3.3 V |
+
+Decision: **do not bridge the footprint.** Fix = a thin wire from **P7 to
+the 3V3 hole of the SWD header** (the same hole the ST-LINK 3.3 V uses; it is
+a through-hole, so it can be reached from the top side). Pin 7 to GND did not
+beep, so this is safe. Battery off while soldering.
+
+Design note for Rev12: IC1 VCCB has no 3.3 V connection on Rev11 (the
+footprint above IC1 is not fitted and its other pad is not on 3.3 V). VCCB
+also needs its own 100 nF decoupling capacitor to GND.
+
+Next: after the wire, check pin 7 = 3.3 V and pins 3 / 6 still 1.8 V, then run `t`.
