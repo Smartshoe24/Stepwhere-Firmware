@@ -5,7 +5,7 @@ records motion data into the board's own W25Q128 flash, so the board can be
 in the shoe **without a cable**. You download the recordings afterwards.
 
 Prebuilt: [`prebuilt/lis2dh12_bringup.bin`](../../prebuilt/lis2dh12_bringup.bin)
-(v0.4, standalone, linked at 0x08000000).
+(v0.5, standalone, linked at 0x08000000).
 
 ## 0. Get the tools (once, on the Mac)
 
@@ -43,7 +43,7 @@ python3 ota_uart.py monitor --port /dev/cu.usbserial-0001
 Press reset (or power-cycle). It prints:
 
 ```
-=== Stepwhere LIS2DH12 board check (lis2dh12_bringup v0.4) ===
+=== Stepwhere LIS2DH12 board check (lis2dh12_bringup v0.5) ===
 I2C devices: 0x19
 [PASS] I2C scan finds a device
 [PASS] WHO_AM_I = 0x33 at 0x19 - ...

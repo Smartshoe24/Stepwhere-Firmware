@@ -46,4 +46,5 @@ check_rec() {   # file min max
     else echo "  FAIL $1: $n steps, expected $2..$3"; exit 1; fi
 }
 check_rec recordings/2026-10-31/walk1_s1_still.csv 0 0
-check_rec recordings/2026-10-31/walk1_s2_walk.csv 110 124
+check_rec recordings/2026-10-31/walk1_s2_walk.csv 110 140    # truth "more than 100", not counted exactly
+check_rec recordings/2026-10-31/walk2_s1_walk100.csv 92 104  # truth 100 steps

@@ -20,6 +20,7 @@ is made; never delete one, mark it "Replaced by S-xx" instead. Context:
 | S-13 | 2026-10-31 | w25q driver, ota_layout.h and fake_w25q copied byte-identical from `ota/foundation` | The log needs the flash driver before PR #1 merges; identical files merge without conflict | Second flash driver |
 | S-14 | 2026-10-31 | Short / weak motion bursts no longer reset the walk; only too-long bursts or bursts with no stance do | First real walk (recordings/2026-10-31): a small burst (~0.2 s, ~0.8 g) sits between every pair of strides, so v0.3 never reached 4 regular strides and counted 0 | Lower the energy threshold (would let seated fidgets in) |
 | S-15 | 2026-10-31 | After a counted walk, 2 regular strides (not 4) restart counting for 10 s | The walk pauses 3-6 s every 5-6 strides (turning); short legs were lost. 110 -> 116 of 122 clear strides | Longer max_stride (keeps counting into the sit-down) |
+| S-16 | 2026-10-31 | When a walk resumes after a pause of 1.6-2.7 stride intervals, count one extra stride (the turn) | walk2 (100 steps in a room): every turn is a pivot with no clear swing, 5 per 100 steps; board counted 86. With this: 94 | Lower thresholds to catch the pivot (would admit fidgets) |
 | S-10 | 2026-10-30 | Proposed acceptance: walking/running within +-3 % over 100 steps; 0 steps in 5 min sitting; < 10 false steps per school hour | Measurable on recordings; owner asked for "best result, nothing while sitting". Not yet confirmed by the owner | No target |
 
 ## Board wiring (Rev10 Gerbers, `Hardware--Stepwhere` branch)

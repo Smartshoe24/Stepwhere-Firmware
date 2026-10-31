@@ -30,7 +30,7 @@ typedef struct { const char *name; size_t off; int is8; } field_t;
 static const field_t k_fields[] = {
     F16(gravity_tau_ms), F16(smooth_ms), F16(low_mg), F16(high_mg), F16(merge_gap_ms),
     F16(min_burst_ms), F16(max_burst_ms), F16(min_energy_gms), F16(min_still_ms),
-    F16(min_stride_ms), F16(max_stride_ms), F8(rhythm_pct), F8(confirm_strides), F8(resume_strides), F16(resume_ms), F8(steps_per_stride),
+    F16(min_stride_ms), F16(max_stride_ms), F8(rhythm_pct), F8(confirm_strides), F8(resume_strides), F16(resume_ms), F8(fill_turns), F8(steps_per_stride),
 };
 
 static int set_field(step_counter_config_t *c, const char *arg)
@@ -142,7 +142,7 @@ int main(int argc, char **argv)
     fclose(f);
     if (!started) { fprintf(stderr, "no samples in %s\n", path); return 1; }
     printf("%-24s %6u steps\n", mark, (unsigned)since_mark);
-    printf("TOTAL %u steps (%u strides) in %.1f s, %u bursts rejected\n", (unsigned)sc.steps,
-           (unsigned)sc.strides, (double)samples * dec / hz, (unsigned)sc.rejected);
+    printf("TOTAL %u steps (%u strides, %u turns) in %.1f s, %u bursts rejected\n", (unsigned)sc.steps,
+           (unsigned)sc.strides, (unsigned)sc.turns, (double)samples * dec / hz, (unsigned)sc.rejected);
     return 0;
 }

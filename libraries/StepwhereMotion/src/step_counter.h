@@ -61,6 +61,8 @@ typedef struct {
     uint8_t  confirm_strides;  /* regular strides needed before counting starts  */
     uint8_t  resume_strides;   /* ... if a walk ended less than resume_ms ago    */
     uint16_t resume_ms;        /* (turning, short stop): 0 = off                 */
+    uint8_t  fill_turns;       /* 1: a pause of ~2 strides inside a walk counts
+                                  the missed turning stride                      */
     uint8_t  steps_per_stride; /* 2: sensor in one shoe only                     */
 } step_counter_config_t;
 
@@ -112,6 +114,9 @@ typedef struct {
     uint32_t last_interval;    /* samples between the last two candidates        */
     bool     walked;           /* a walk has been counted before                 */
     uint32_t walk_end;         /* sample index of the last stride of that walk   */
+    uint32_t walk_iv;          /* stride interval at the end of that walk        */
+    uint32_t seq_start;        /* first stride of the sequence being confirmed   */
+    uint32_t turns;            /* strides added by fill_turns (for tuning)       */
 
     /* results */
     uint32_t strides;

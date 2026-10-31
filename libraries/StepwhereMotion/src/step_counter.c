@@ -23,6 +23,7 @@ void step_counter_default_config(step_counter_config_t *cfg, uint16_t sample_hz)
     cfg->confirm_strides = 4;     /* = 8 steps before counting starts             */
     cfg->resume_strides = 2;      /* after turning / a short stop in a walk       */
     cfg->resume_ms = 10000;
+    cfg->fill_turns = 1;
     cfg->steps_per_stride = 2;
 }
 
@@ -140,6 +141,7 @@ static uint32_t on_burst(step_counter_t *sc)
         sc->last_stride = t;
         sc->last_interval = 0;
         sc->pending = 1;
+        sc->seq_start = t;
         return 0;
     }
 
@@ -149,6 +151,7 @@ static uint32_t on_burst(step_counter_t *sc)
         sc->last_stride = t;                                  /* restart the sequence here */
         sc->last_interval = 0;
         sc->pending = 1;
+        sc->seq_start = t;
         return 0;
     }
     if (iv > sc->max_stride) {                                /* normally caught by the timeout */
@@ -156,33 +159,49 @@ static uint32_t on_burst(step_counter_t *sc)
         sc->last_stride = t;
         sc->last_interval = 0;
         sc->pending = 1;
+        sc->seq_start = t;
         return 0;
     }
 
     if (sc->state == STEP_STATE_WALKING) {
         sc->last_interval = iv;
         sc->last_stride = t;
+        sc->walk_iv = iv;
         return count(sc, 1);
     }
 
     /* IDLE: build up a regular sequence. */
     uint32_t prev = sc->last_interval;
     uint32_t diff = iv > prev ? iv - prev : prev - iv;
-    if (prev == 0 || diff * 100u <= prev * sc->cfg.rhythm_pct)
+    if (prev == 0 || diff * 100u <= prev * sc->cfg.rhythm_pct) {
         sc->pending++;
-    else
+    } else {
         sc->pending = 2;                                      /* last two still form a pair */
+        sc->seq_start = sc->last_stride;
+    }
     sc->last_interval = iv;
     sc->last_stride = t;
 
     /* Right after a walk (turning around, a short stop) fewer regular
      * strides are needed to carry on counting. */
     uint32_t need = sc->cfg.confirm_strides;
-    if (sc->resume && sc->walked && (t - sc->walk_end) <= sc->resume) need = sc->cfg.resume_strides;
+    bool resumed = sc->resume && sc->walked && (sc->seq_start - sc->walk_end) <= sc->resume;
+    if (resumed) need = sc->cfg.resume_strides;
     if (sc->pending >= need) {
         uint32_t n = sc->pending;
+        /* Turning: the gap from the end of the walk to this sequence is
+         * about two strides, i.e. one stride of this foot was a pivot with
+         * no clear swing (recordings/2026-10-31). Count it. */
+        if (resumed && sc->cfg.fill_turns && sc->walk_iv) {
+            uint32_t gap = sc->seq_start - sc->walk_end;
+            if (gap * 10u >= sc->walk_iv * 16u && gap * 10u <= sc->walk_iv * 27u) {
+                n++;
+                sc->turns++;
+            }
+        }
         sc->pending = 0;
         sc->state = STEP_STATE_WALKING;
+        sc->walk_iv = iv;
         return count(sc, n);
     }
     return 0;
