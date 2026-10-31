@@ -7,12 +7,27 @@ in the shoe **without a cable**. You download the recordings afterwards.
 Prebuilt: [`prebuilt/lis2dh12_bringup.bin`](../../prebuilt/lis2dh12_bringup.bin)
 (v0.2, standalone, linked at 0x08000000).
 
+## 0. Get the tools (once, on the Mac)
+
+The commands below assume a folder with the two scripts in it. No clone needed:
+
+```sh
+mkdir -p ~/stepwhere && cd ~/stepwhere
+curl -LO https://raw.githubusercontent.com/Smartshoe24/Stepwhere-Firmware/ota/foundation/tools/ota_uart.py
+curl -LO https://raw.githubusercontent.com/Smartshoe24/Stepwhere-Firmware/feature/lis2dh12-steps/tools/record_steps.py
+curl -LO https://github.com/Smartshoe24/Stepwhere-Firmware/raw/feature/lis2dh12-steps/prebuilt/lis2dh12_bringup.bin
+pip3 install pyserial
+```
+
+Run the scripts from that folder as `python3 ota_uart.py ...` and
+`python3 record_steps.py ...` (no `tools/` in front).
+
 ## 1. Flash
 
 STM32CubeProgrammer + ST-LINK (SWD), address **0x08000000**:
 
 ```sh
-STM32_Programmer_CLI -c port=SWD -w prebuilt/lis2dh12_bringup.bin 0x08000000 -v -rst
+STM32_Programmer_CLI -c port=SWD -w lis2dh12_bringup.bin 0x08000000 -v -rst
 ```
 
 This replaces the bootloader and the app on that board. To go back to normal
@@ -22,7 +37,7 @@ the external flash are not touched (the log uses 0x070000-0xFF0000).
 ## 2. Board check (cable connected, board lying still, on battery)
 
 ```sh
-python3 tools/ota_uart.py monitor --port /dev/cu.usbserial-0001
+python3 ota_uart.py monitor --port /dev/cu.usbserial-0001
 ```
 
 Press reset (or power-cycle). It prints:
@@ -86,7 +101,7 @@ Take the board out, connect the cable, then run (not at the same time as the mon
 
 ```sh
 pip3 install pyserial
-python3 tools/record_steps.py dump --port /dev/cu.usbserial-0001 --label day1
+python3 record_steps.py dump --port /dev/cu.usbserial-0001 --label day1
 ```
 
 You get one file per session in `recordings/`, and the board's step count
