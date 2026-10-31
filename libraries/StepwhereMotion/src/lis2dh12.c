@@ -48,6 +48,12 @@ int16_t lis2dh12_raw_to_mg(int16_t raw, lis2dh12_mode_t mode, lis2dh12_fs_t fs)
     return (int16_t)v;
 }
 
+lis2dh12_status_t lis2dh12_read_reg(lis2dh12_t *dev, uint8_t reg, uint8_t *val)
+{
+    if (!dev || !val || reg > 0x3Fu) return LIS2DH12_ERR_PARAM;
+    return rd(dev, reg, val, 1);
+}
+
 lis2dh12_status_t lis2dh12_read_id(lis2dh12_t *dev, uint8_t *id)
 {
     if (!dev || !id) return LIS2DH12_ERR_PARAM;

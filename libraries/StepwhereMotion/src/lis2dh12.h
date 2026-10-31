@@ -157,6 +157,9 @@ lis2dh12_status_t lis2dh12_init(lis2dh12_t *dev, const lis2dh12_bus_t *bus, uint
  * and the FIFO is restarted empty. */
 lis2dh12_status_t lis2dh12_configure(lis2dh12_t *dev, const lis2dh12_config_t *cfg);
 
+/* Read any single register (diagnostics). */
+lis2dh12_status_t lis2dh12_read_reg(lis2dh12_t *dev, uint8_t reg, uint8_t *val);
+
 /* Read WHO_AM_I into *id (any value, no check). */
 lis2dh12_status_t lis2dh12_read_id(lis2dh12_t *dev, uint8_t *id);
 

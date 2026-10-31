@@ -27,6 +27,7 @@
  * Requires libraries/StepwhereMotion and libraries/StepwhereOTA.
  */
 #include <HardwareSerial.h>
+#include <IWatchdog.h>
 #include <Wire.h>
 #include <LIS2DH12Arduino.h>
 #include <W25QArduino.h>
@@ -52,7 +53,7 @@
 #define FLASH_HOLD PB12
 #define LDO_EN     PA10  // GSM/GPS LDO, kept off
 
-#define FW_NAME "lis2dh12_bringup v0.2"
+#define FW_NAME "lis2dh12_bringup v0.3"
 #define REC_HZ  50u
 #define SAMPLE_MS (1000u / REC_HZ)
 
@@ -83,6 +84,28 @@ static uint32_t g_live_index = 0;
 static uint32_t g_marks = 0;
 static uint32_t g_overruns = 0;
 static uint32_t g_last_status = 0;
+static uint32_t g_last_sample_ms = 0;   // last time the FIFO gave samples
+static uint32_t g_restarts = 0;         // sensor restarts after a stall
+static uint32_t g_i2c_errors = 0;
+static bool g_resync = false;           // next batch: place it by the clock
+
+// Why the MCU started (RCC_CSR flags, read once at boot, then cleared).
+static void print_reset_cause()
+{
+    uint32_t csr = RCC->CSR;
+    SerialDBG.print("Reset cause:");
+    if (csr & RCC_CSR_LPWRRSTF) SerialDBG.print(" low-power");
+    if (csr & RCC_CSR_WWDGRSTF) SerialDBG.print(" window-watchdog");
+    if (csr & RCC_CSR_IWDGRSTF) SerialDBG.print(" WATCHDOG (firmware hung)");
+    if (csr & RCC_CSR_SFTRSTF)  SerialDBG.print(" software");
+    if (csr & RCC_CSR_PWRRSTF)  SerialDBG.print(" POWER (power-up or brown-out)");
+    if (csr & RCC_CSR_PINRSTF)  SerialDBG.print(" reset-pin");
+    if (csr & RCC_CSR_OBLRSTF)  SerialDBG.print(" option-bytes");
+    SerialDBG.print("  (CSR ");
+    SerialDBG.print(csr >> 24, HEX);
+    SerialDBG.println(")");
+    RCC->CSR |= RCC_CSR_RMVF;
+}
 
 static void steps_reset()
 {
@@ -228,7 +251,10 @@ static void check_accel(bool with_int2)
         uint32_t idle_edges = g_int2_edges;
         SerialDBG.println("       Now MOVE or tap the board (10 s) ...");
         t0 = millis();
-        while (millis() - t0 < 10000 && g_int2_edges == idle_edges) delay(10);
+        while (millis() - t0 < 10000 && g_int2_edges == idle_edges) {
+            delay(10);
+            IWatchdog.reload();
+        }
         uint32_t moved = g_int2_edges - idle_edges;
         snprintf(buf, sizeof(buf), "%lu edges while still, %lu when moved", (unsigned long)idle_edges,
                  (unsigned long)moved);
@@ -267,13 +293,15 @@ static void print_info()
     }
     uint32_t used = mlog_pages_used(&g_log), total = mlog_pages_total(&g_log);
     uint32_t free_min = (total - used) * MLOG_SAMPLES / REC_HZ / 60u;
-    char buf[120];
-    snprintf(buf, sizeof(buf), "#info %s, session %u, log %lu/%lu pages (%lu.%lu%%), %lu h %lu min left, steps %lu",
+    char buf[160];
+    snprintf(buf, sizeof(buf), "#info %s, session %u, log %lu/%lu pages (%lu.%lu%%), %lu h %lu min left, steps %lu, "
+             "up %lu s, sensor restarts %lu, I2C errors %lu",
              g_mode == MODE_FLASH ? "RECORDING" : (g_mode == MODE_LIVE ? "live" : "stopped"),
              g_log.session ? g_log.session : g_log.last_session, (unsigned long)used, (unsigned long)total,
              (unsigned long)(used * 100u / total), (unsigned long)(used * 1000u / total % 10u),
              (unsigned long)(free_min / 60u), (unsigned long)(free_min % 60u),
-             (unsigned long)step_counter_steps(&g_steps));
+             (unsigned long)step_counter_steps(&g_steps), (unsigned long)(millis() / 1000u),
+             (unsigned long)g_restarts, (unsigned long)g_i2c_errors);
     SerialDBG.println(buf);
 }
 
@@ -292,7 +320,9 @@ static bool start_sensor()
     }
     steps_reset();
     g_sess_start_ms = millis();
+    g_last_sample_ms = millis();
     g_overruns = 0;
+    g_resync = false;
     return true;
 }
 
@@ -350,6 +380,32 @@ static void start_live()
     SerialDBG.println("#t_ms,x_mg,y_mg,z_mg");
 }
 
+// The FIFO gave no samples for 2 s (it should give 50 per second). Report
+// what the sensor says, then set it up again. CTRL_REG1 = 00 means the
+// sensor lost its configuration, i.e. it was reset or lost power.
+static void sensor_stalled()
+{
+    lis2dh12_t *d = accel.dev();
+    uint8_t who = 0, c1 = 0, fs = 0;
+    bool ok = lis2dh12_read_reg(d, LIS2DH12_WHO_AM_I, &who) == LIS2DH12_OK &&
+              lis2dh12_read_reg(d, LIS2DH12_CTRL_REG1, &c1) == LIS2DH12_OK &&
+              lis2dh12_read_reg(d, LIS2DH12_FIFO_SRC_REG, &fs) == LIS2DH12_OK;
+    char buf[120];
+    snprintf(buf, sizeof(buf), "#WARN no samples for %lu ms at up %lu s: %s WHO_AM_I %02X CTRL_REG1 %02X FIFO_SRC %02X",
+             (unsigned long)(millis() - g_last_sample_ms), (unsigned long)(millis() / 1000u),
+             ok ? "I2C ok," : "I2C FAILED,", who, c1, fs);
+    SerialDBG.println(buf);
+    g_restarts++;
+    steps_gap();
+    g_resync = true;
+    g_last_sample_ms = millis();
+    lis2dh12_config_t c = record_config();
+    lis2dh12_status_t st = lis2dh12_init(d, &d->bus, d->addr);
+    if (st == LIS2DH12_OK) st = lis2dh12_configure(d, &c);
+    SerialDBG.print("#sensor restart: ");
+    SerialDBG.println(lis2dh12_status_str(st));
+}
+
 static void service_sensor()
 {
     static uint32_t last_poll = 0;
@@ -362,18 +418,27 @@ static void service_sensor()
 
     uint8_t level = 0;
     bool ovr = false;
-    if (lis2dh12_fifo_level(accel.dev(), &level, &ovr) != LIS2DH12_OK) {
-        SerialDBG.println("#ERROR I2C");
-        return;
-    }
     lis2dh12_sample_t s[32];
     size_t got = 0;
-    if (lis2dh12_fifo_read(accel.dev(), s, 32, &got) != LIS2DH12_OK || got == 0) return;
+    if (lis2dh12_fifo_level(accel.dev(), &level, &ovr) != LIS2DH12_OK ||
+        lis2dh12_fifo_read(accel.dev(), s, 32, &got) != LIS2DH12_OK) {
+        g_i2c_errors++;
+        if (g_i2c_errors < 20 || g_i2c_errors % 100 == 0) {
+            SerialDBG.print("#ERROR I2C, count ");
+            SerialDBG.println(g_i2c_errors);
+        }
+        got = 0;
+    }
+    if (got == 0) {
+        if (millis() - g_last_sample_ms > 2000) sensor_stalled();
+        return;
+    }
+    g_last_sample_ms = millis();
 
     uint32_t t;
     if (g_mode == MODE_FLASH) {
         t = mlog_next_time(&g_log);
-        if (ovr) {
+        if (ovr || g_resync) {
             // Samples were lost: place this batch by the clock, on the 20 ms grid.
             uint32_t now = millis() - g_sess_start_ms;
             uint32_t est = now > (got - 1) * SAMPLE_MS ? now - (got - 1) * SAMPLE_MS : 0;
@@ -383,6 +448,7 @@ static void service_sensor()
     } else {
         t = g_live_index * SAMPLE_MS;
     }
+    g_resync = false;
     if (ovr) {
         g_overruns++;
         steps_gap();
@@ -413,10 +479,6 @@ static void service_sensor()
         SerialDBG.print("#steps ");
         SerialDBG.println(step_counter_steps(&g_steps));
     }
-    if (g_mode == MODE_FLASH && millis() - g_last_status > 30000) {
-        g_last_status = millis();
-        print_info();
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -436,6 +498,7 @@ static void dump()
     uint32_t next_t = 0, samples = 0, gaps = 0, bad = 0;
     char line[48];
     for (uint32_t i = 0; i <= pages; i++) {
+        IWatchdog.reload();
         mlog_page_kind_t k = (i < pages) ? mlog_read_page(&g_log, i, &p) : MLOG_PAGE_ERASED;
         if (k == MLOG_PAGE_CORRUPT) {
             bad++;
@@ -482,6 +545,7 @@ static void dump()
 
 static void erase_progress(void *, uint32_t done, uint32_t total)
 {
+    IWatchdog.reload();
     if (done == total || done % 16 == 0) {
         SerialDBG.print("#erase ");
         SerialDBG.print(done);
@@ -591,6 +655,12 @@ void setup()
     // Pull-up on USART1 RX (PB7) so an unplugged cable leaves the line idle.
     GPIOB->PUPDR = (GPIOB->PUPDR & ~(3u << (7 * 2))) | (1u << (7 * 2));
     delay(300);
+    SerialDBG.println();
+    SerialDBG.println(FW_NAME);
+    print_reset_cause();
+    // Watchdog, 25 s: restarts the board if the firmware hangs (a new
+    // session starts and the next boot prints "WATCHDOG").
+    IWatchdog.begin(25000000UL);
     dev_i2c.begin();
     dev_i2c.setClock(400000);
     attachInterrupt(digitalPinToInterrupt(ACC_INT1), isr_int1, FALLING);
@@ -609,10 +679,16 @@ void setup()
 
 void loop()
 {
+    IWatchdog.reload();
     while (SerialDBG.available()) handle_key(SerialDBG.read());
     if (g_pending && millis() - g_pending_ms > 5000) {
         g_pending = 0;
         SerialDBG.println("#cancelled (no y)");
     }
     if (g_mode != MODE_IDLE) service_sensor();
+    // Status every 30 s while recording, whether or not data arrives.
+    if (g_mode == MODE_FLASH && millis() - g_last_status > 30000) {
+        g_last_status = millis();
+        print_info();
+    }
 }
