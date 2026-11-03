@@ -73,6 +73,26 @@ struct vdd_mon {
 uint32_t gpsreset_magic
   __attribute__((section(".noinit")));
 
+// ─── Step total kept across software resets (.noinit RAM) ────────────────────
+// .noinit is not zeroed by the startup code (the linker places it after .bss,
+// before the heap; check the .map file after a core update). After a real
+// power loss RAM is random: magic + inverted copy must both match, otherwise
+// the total starts at 0.
+#define STEPS_PERSIST_MAGIC 0x53544550UL  // "STEP"
+struct StepsPersist {
+  uint32_t magic;
+  uint32_t steps_total;
+  uint32_t steps_total_inv;  // ~steps_total
+  uint32_t restores;         // how many times it was restored (diagnostic)
+};
+StepsPersist g_steps_persist __attribute__((section(".noinit")));
+
+void persist_save(uint32_t steps_total) {
+  g_steps_persist.steps_total = steps_total;
+  g_steps_persist.steps_total_inv = ~steps_total;
+  g_steps_persist.magic = STEPS_PERSIST_MAGIC;
+}
+
 // ─── Serial port aliases ──────────────────────────────────────────────────────
 // STM32duino HardwareSerial constructor takes (RX_pin, TX_pin).
 
@@ -149,10 +169,13 @@ NullStream nullStream;   // define once in a .cpp, see below
 
 
 #define MIN_SAT 3
-#define GPS_NO_FIX_TIMEOUT_MS (10UL * 60UL * 1000UL)
+// Reboot only if the GPS UART sends nothing for this long (module dead or
+// unpowered). No fix with NMEA data arriving never reboots (item 3).
+#define GPS_SILENT_TIMEOUT_MS (10UL * 60UL * 1000UL)
+#define GPS_STATUS_INTERVAL_MS 60000UL  // [GPS] data/satellites line
 
-uint32_t gpsNoFixStart = 0;
-bool gpsNoFixTimerRunning = false;
+uint32_t g_gps_rx_ms = 0;        // millis() when the last NMEA byte arrived
+uint32_t g_gps_chars_seen = 0;   // gps.charsProcessed() at that time
 
 
 // ─── Baud rates ───────────────────────────────────────────────────────────────
@@ -164,6 +187,14 @@ bool gpsNoFixTimerRunning = false;
 #define AT_TIMEOUT 3000
 #define AT_LONG_TIMEOUT 15000
 #define HTTP_TIMEOUT 30000
+#define AT_PROBE_TIMEOUT 300           // "is the modem already on?" check
+#define CFUN_TIMEOUT 15000             // AT+CFUN=1 (radio + SIM back on)
+#define SIM_READY_TIMEOUT_MS 10000UL   // wait for +CPIN: READY
+#define NET_DIAG_REPEAT_MS (10UL * 60UL * 1000UL)  // [NET] diagnostics at most this often
+#define CSQ_USABLE 10                  // CSQ below this is reported as WEAK
+#define MODEM_HARD_RESET_AFTER 3       // failed modem checks in a row before an LDO power cycle
+
+uint8_t g_modem_fail_count = 0;        // consecutive modem_check() failures
 
 //─── Power / location timer config ───────────────────────────────────────────
 #define CHECK_INTERVAL_MS 30000UL     // check location every 30000 seconds
@@ -181,7 +212,10 @@ bool gpsNoFixTimerRunning = false;
 //______ Variable
 
 // ─── Network / server config ─ edit before flashing ──────────────────────────
-#define APN "internet"                           // Operator APN
+// Operator APN. Airtel IoT M2M SIMs: T9 got an IP with "internet"; the SIM
+// supplier's APN may be "airteliot.com" (being confirmed). If data fails while
+// registered, the [NET] diagnostics say "APN ... likely rejected".
+#define APN "internet"
 #define HTTP_SERVER "http://admin.stepwhere.in"  // Host (no http://)
 #define HTTP_PORT 80
 #define HTTPS_PORT 443
@@ -219,9 +253,17 @@ const char ROOT_CA[] = { 0 };
 #define HTTPS_AUTH_MODE 1                 // 0=no auth 1=server auth 2=mutual auth
 
 // ─── Version ────────────────────────────────────────────────────────────────
-#define APP_VERSION "v1.2-lis2dh12"  // test build: LIS2DH12 + software steps, no OTA
+#define APP_VERSION "v1.2-lis2dh12.2"  // test build: LIS2DH12 + software steps, no OTA; .2 = review items 1-8
 // ─── TinyGPS++ ────────────────────────────────────────────────────────────────
 TinyGPSPlus gps;
+// Satellites in view (field 3 of every GSV sentence) per constellation, for
+// the once-a-minute [GPS] line. gps.satellites only counts satellites used
+// in a fix. The G7A's talker IDs are not known, so all common ones are read.
+TinyGPSCustom gsv_gp(gps, "GPGSV", 3);  // GPS
+TinyGPSCustom gsv_gl(gps, "GLGSV", 3);  // GLONASS
+TinyGPSCustom gsv_ga(gps, "GAGSV", 3);  // Galileo
+TinyGPSCustom gsv_bd(gps, "BDGSV", 3);  // BeiDou (old ID)
+TinyGPSCustom gsv_gb(gps, "GBGSV", 3);  // BeiDou (NMEA 4.1 ID)
 
 
 //variable
@@ -245,6 +287,9 @@ String build_location_telemetry_json();
 String json_escape(const String &value);
 bool https_post(const char *json_payload);
 void gps_feed(uint32_t duration_ms);
+void gps_pump();
+void gps_status_minute();
+void net_diag(const char *failed_cmd, const String &failed_reply);
 void print_gps_info();
 void build_json(char *buf, size_t buf_size, const String &imei);
 bool neoway_test(const char *json_payload);
@@ -257,17 +302,38 @@ void ldo_enable(bool on) {
   digitalWrite(LDO_EN, on ? HIGH : LOW);
   DEBUG.print("[LDO] ");
   DEBUG.println(on ? "ON" : "OFF");
-  if (on) delay(100);  // let the rail stabilise
+  if (on) {
+    delay(100);  // let the rail stabilise
+    // The GPS was unpowered until now: start its silence timer fresh.
+    g_gps_rx_ms = millis();
+    g_gps_chars_seen = gps.charsProcessed();
+  }
+}
+
+/** true if the modem answers AT (short timeout, 3 tries). */
+bool gsm_alive() {
+  for (int i = 0; i < 3; i++) {
+    if (gsm_send_at("AT", "OK", AT_PROBE_TIMEOUT)) return true;
+  }
+  return false;
 }
 
 /**
  * Power ON — Neoway N706.
  * PWRKEY must be held LOW for ≥ 1 s while VBAT is present.
+ * The pulse is sent only if the modem does not answer AT: on a modem that is
+ * already running (after AT+CFUN=0, or a recovery retry) a PWRKEY pulse can
+ * switch it off instead (item 4).
  */
 void gsm_power_on() {
   DEBUG.println("[GSM] Power ON ...");
   ldo_enable(true);
   delay(500);  // LDO settle
+
+  if (gsm_alive()) {
+    DEBUG.println("[GSM] Modem already on (answers AT) - PWRKEY pulse skipped.");
+    return;
+  }
 
   digitalWrite(GSM_PWRKEY, HIGH);
   delay(100);
@@ -365,6 +431,25 @@ struct StepTracker {
     return (millis() - last_active_ms) >= STEP_INACTIVITY_LIMIT_MS;
   }
 } g_steps;
+
+// ─── Minute report: filled by the TIM16 ISR, printed from loop() ──────────────
+struct MinuteReport {
+  uint16_t minute;
+  uint32_t steps_min;
+  uint32_t steps_total;
+  bool gprs;
+  bool gps_fix;
+  bool sleep_on;
+  bool idle_counted;     // the idle-minute counter was advanced
+  uint8_t idle_minute;
+  bool evaluated;        // IDLE_TIME reached: sleep decision taken
+  bool flagged_sleep;
+  uint32_t dist_dm;      // distance from the sleep reference, 0.1 m
+};
+MinuteReport g_minute_report;          // copied with interrupts off
+volatile bool g_minute_report_due = false;
+volatile uint32_t g_minute_reports_missed = 0;
+void minute_report_service();
 
 // ─── Location / sleep tracker ─────────────────────────────────────────────────
 struct LocationTracker {
@@ -493,6 +578,7 @@ bool gsm_send_at(const char *cmd,
   bool ret_code = false;
 
   while ((millis() - start) < timeout_ms) {
+    gps_pump();  // keep NMEA flowing during long AT waits
     while (SerialGSM.available()) {
       char c = (char)SerialGSM.read();
       reply += c;
@@ -545,6 +631,13 @@ bool gsm_send_at(const char *cmd,
     if (millis() - dot > 1000) {
       dot = millis();
       DEBUG.print(".");
+      // Long AT waits: still print the minute report, but only while the
+      // modem is quiet. The print blocks ~70 ms; the 64-byte GSM RX buffer
+      // would overflow in ~6 ms if a reply arrived meanwhile.
+      if (!SerialGSM.available() && millis() - lastRx > 500) {
+        gps_pump();
+        minute_report_service();
+      }
     }
   }
 
@@ -583,23 +676,60 @@ bool modem_check() {
   }
 
   gsm_send_at("ATE0", "OK", AT_TIMEOUT);
+  gsm_send_at("AT+CMEE=2", "OK", AT_TIMEOUT);  // errors as text: "+CME ERROR: <reason>"
 
-  DEBUG.println("[Modem] Checking SIM (AT+CPIN?) ...");
+  // Sleep sends AT+CFUN=0 (radio and SIM off) and the LDO stays on, so the
+  // modem is still in CFUN=0 after wake-up. Turn it back on (item 4).
   String reply;
-  if (!gsm_send_at("AT+CPIN?", "+CPIN:", AT_TIMEOUT, &reply)) {
-    DEBUG.println("[Modem] ERROR: No CPIN response");
-    return false;
-  } else {
-    // return true;
-    if (reply.indexOf("READY") != -1) {
-      DEBUG.println("[Modem] SIM READY");
-      return true;
+  if (gsm_send_at("AT+CFUN?", "OK", AT_TIMEOUT, &reply) && reply.indexOf("+CFUN: 1") == -1) {
+    INFO.println("[Modem] Radio is off (CFUN != 1) - sending AT+CFUN=1 ...");
+    if (!gsm_send_at("AT+CFUN=1", "OK", CFUN_TIMEOUT)) {
+      ERR.println("[Modem] ERROR: AT+CFUN=1 failed");
     }
   }
+
+  // The SIM needs a few seconds after power-on or CFUN=1: poll for READY.
+  DEBUG.println("[Modem] Checking SIM (AT+CPIN?) ...");
+  uint32_t t0 = millis();
+  do {
+    if (gsm_send_at("AT+CPIN?", "+CPIN:", AT_TIMEOUT, &reply) && reply.indexOf("READY") != -1) {
+      DEBUG.println("[Modem] SIM READY");
+      g_modem_fail_count = 0;
+      return true;
+    }
+    delay(1000);
+  } while (millis() - t0 < SIM_READY_TIMEOUT_MS);
+  DEBUG.println("[Modem] ERROR: SIM not READY (see the CPIN reply above)");
   // if      (reply.indexOf("SIM PIN") != -1) DEBUG.println("[Modem] ERROR: SIM PIN required");
   // else if (reply.indexOf("SIM PUK") != -1) DEBUG.println("[Modem] ERROR: SIM PUK required");
   // else                                      DEBUG.println("[Modem] ERROR: SIM not ready");
   return false;
+}
+
+/**
+ * Recovery after modem_check() failed. gsm_power_on() no longer pulses
+ * PWRKEY on a modem that answers AT, so the usual CFUN=0 / power-on pass
+ * cannot reset a modem that answers AT but is stuck (e.g. SIM never READY).
+ * After MODEM_HARD_RESET_AFTER failures in a row the LDO is cut instead (the
+ * GPS loses power too and restarts cold), then the modem gets a normal
+ * power-on with PWRKEY.
+ */
+void modem_recover() {
+  g_modem_fail_count++;
+  if (g_modem_fail_count >= MODEM_HARD_RESET_AFTER) {
+    ERR.print("[GSM] ");
+    ERR.print(g_modem_fail_count);
+    ERR.println(" failed modem checks in a row - hard power cycle (LDO off 3 s, GPS restarts too)");
+    g_modem_fail_count = 0;
+    ldo_enable(false);
+    delay(3000);
+    gsm_power_on();  // LDO on; the modem is off now, so PWRKEY is pulsed
+  } else {
+    gsm_power_off();
+    delay(2000);
+    gsm_power_on();
+  }
+  delay(3000);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -630,6 +760,169 @@ String get_imei() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+//  NETWORK DIAGNOSTICS  (after a GPRS failure, item 2)
+//  AT+CSQ, AT+CEREG?, AT+CGREG?, AT+COPS?, AT+CGDCONT?, AT+CEER, decoded into
+//  a few [NET] lines and one verdict. Logged on the first failure after a
+//  success, then at most every NET_DIAG_REPEAT_MS while it keeps failing.
+// ═════════════════════════════════════════════════════════════════════════════
+
+bool g_net_diag_logged = false;
+uint32_t g_net_diag_ms = 0;
+
+/** The line of r that starts with prefix (trimmed), or "". */
+static String at_line(const String &r, const char *prefix) {
+  int p = r.indexOf(prefix);
+  if (p < 0) return String();
+  int e = r.indexOf('\n', p);
+  String s = r.substring(p, e < 0 ? (int)r.length() : e);
+  s.trim();
+  return s;
+}
+
+/** Integer field (0 = first value after the prefix) of a "+XXX: a,b,c" line, or -1. */
+static int at_field_int(const String &line, uint8_t field) {
+  int p = line.indexOf(':');
+  if (p < 0) return -1;
+  p++;
+  for (uint8_t i = 0; i < field; i++) {
+    p = line.indexOf(',', p);
+    if (p < 0) return -1;
+    p++;
+  }
+  while (p < (int)line.length() && line[p] == ' ') p++;
+  if (p >= (int)line.length() || !isDigit(line[p])) return -1;
+  return line.substring(p).toInt();
+}
+
+/** The nth (0-based) "quoted" string of a line, or "". */
+static String at_quoted(const String &line, uint8_t nth) {
+  int p = -1;
+  for (uint8_t i = 0; i <= nth; i++) {
+    p = line.indexOf('"', p + 1);
+    if (p < 0) return String();
+    int e = line.indexOf('"', p + 1);
+    if (e < 0) return String();
+    if (i == nth) return line.substring(p + 1, e);
+    p = e;
+  }
+  return String();
+}
+
+static const char *reg_stat_name(int stat) {
+  switch (stat) {
+    case 0: return "not searching";
+    case 1: return "home";
+    case 2: return "searching";
+    case 3: return "DENIED";
+    case 4: return "unknown";
+    case 5: return "roaming";
+    default: return "n/a";
+  }
+}
+
+static const char *csq_label(int rssi) {
+  if (rssi < 0 || rssi == 99) return "NO SIGNAL / unknown";
+  if (rssi < CSQ_USABLE) return "WEAK";
+  if (rssi < 15) return "ok";
+  if (rssi < 20) return "good";
+  return "excellent";
+}
+
+void net_diag(const char *failed_cmd, const String &failed_reply) {
+  if (g_net_diag_logged && millis() - g_net_diag_ms < NET_DIAG_REPEAT_MS) {
+    INFO.print("[NET] ");
+    INFO.print(failed_cmd);
+    INFO.println(" failed again (full diagnostics repeat every 10 min, see the last [NET] block)");
+    return;
+  }
+  g_net_diag_logged = true;
+  g_net_diag_ms = millis();
+
+  String r;
+  gsm_send_at("AT+CSQ", "OK", AT_TIMEOUT, &r);
+  int rssi = at_field_int(at_line(r, "+CSQ:"), 0);
+  gsm_send_at("AT+CEREG?", "OK", AT_TIMEOUT, &r);
+  int cereg = at_field_int(at_line(r, "+CEREG:"), 1);
+  gsm_send_at("AT+CGREG?", "OK", AT_TIMEOUT, &r);
+  int cgreg = at_field_int(at_line(r, "+CGREG:"), 1);
+  gsm_send_at("AT+COPS?", "OK", AT_TIMEOUT, &r);
+  String cops = at_line(r, "+COPS:");
+  String oper = at_quoted(cops, 0);
+  int act = at_field_int(cops, 3);
+  gsm_send_at("AT+CGDCONT?", "OK", AT_TIMEOUT, &r);
+  String modem_apn = at_quoted(at_line(r, "+CGDCONT: 1,"), 1);
+  gsm_send_at("AT+CEER", "OK", AT_TIMEOUT, &r);
+  String ceer = at_line(r, "+CEER:");
+
+  String err = at_line(failed_reply, "+CME ERROR");
+  if (err.length() == 0) err = at_line(failed_reply, "ERROR");
+  if (err.length() == 0) err = failed_reply.length() ? "no OK (see reply above)" : "no reply (timeout)";
+
+  INFO.println("[NET] ---------------- network diagnostics ----------------");
+  INFO.print("[NET] failed     : ");
+  INFO.print(failed_cmd);
+  INFO.print(" -> ");
+  INFO.println(err);
+
+  INFO.print("[NET] signal     : CSQ ");
+  if (rssi < 0) INFO.print("?");
+  else INFO.print(rssi);
+  if (rssi >= 0 && rssi <= 31) {
+    INFO.print(" = ");
+    INFO.print(-113 + 2 * rssi);
+    INFO.print(" dBm");
+  }
+  INFO.print("  ");
+  INFO.print(csq_label(rssi));
+  INFO.println("   (0-9 weak, 10-14 ok, 15-19 good, 20-31 excellent, 99 no signal)");
+
+  INFO.print("[NET] network    : CEREG ");
+  INFO.print(cereg);
+  INFO.print(" (");
+  INFO.print(reg_stat_name(cereg));
+  INFO.print(")  CGREG ");
+  INFO.print(cgreg);
+  INFO.print(" (");
+  INFO.print(reg_stat_name(cgreg));
+  INFO.print(")  operator \"");
+  INFO.print(oper);
+  INFO.print("\"");
+  if (act >= 0) {
+    INFO.print(" act ");
+    INFO.print(act);
+    if (act == 7) INFO.print(" (LTE)");
+  }
+  INFO.println();
+
+  INFO.print("[NET] APN        : modem has \"");
+  INFO.print(modem_apn);
+  INFO.print("\", firmware APN \"");
+  INFO.print(APN);
+  INFO.println("\"");
+  INFO.print("[NET] last cause : ");
+  INFO.println(ceer.length() ? ceer : String("(AT+CEER gave nothing)"));
+
+  bool registered = (cereg == 1 || cereg == 5 || cgreg == 1 || cgreg == 5);
+  INFO.print("[NET] verdict    : ");
+  if (rssi < 0 && cereg < 0 && cgreg < 0 && cops.length() == 0) {
+    INFO.println("modem not answering the diagnostic commands -> modem hung, or UART / power problem");
+  } else if (rssi < 0 || rssi == 99 || rssi < 5) {
+    INFO.println("no / very weak signal -> check the antenna wire and its solder joint");
+  } else if (cereg == 3 || cgreg == 3) {
+    INFO.println("registration DENIED -> SIM not activated for data / M2M plan, or blocked (ask the SIM supplier)");
+  } else if (!registered) {
+    if (cereg == 2 || cgreg == 2) INFO.println("not registered yet, still searching -> weak signal or no coverage; wait");
+    else INFO.println("not registered and not searching -> radio off (CFUN?) or no network for this SIM");
+  } else {
+    INFO.print("registered, but data refused -> APN \"");
+    INFO.print(APN);
+    INFO.println("\" likely rejected (try the SIM supplier's APN, e.g. \"airteliot.com\")");
+  }
+  if (rssi >= 5 && rssi < CSQ_USABLE && rssi != 99) INFO.println("[NET] note       : signal is WEAK; data may fail even with the right APN");
+  INFO.println("[NET] --------------------------------------------------------");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 //  GPRS ON  (AT+CGDCONT → AT+XIIC=1)
 //  N706 AT Manual §5.2: AT+CGDCONT must be set before AT+XIIC=1
 // ═════════════════════════════════════════════════════════════════════════════
@@ -646,9 +939,11 @@ bool gprs_on() {
   INFO.println("[GPRS] Configuring APN (AT+CGDCONT) ...");
 
   char cmd[80];
+  String reply;
   snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"IP\",\"%s\"", APN);
-  if (!gsm_send_at(cmd, "OK", AT_TIMEOUT)) {
+  if (!gsm_send_at(cmd, "OK", AT_TIMEOUT, &reply)) {
     ERR.println("[GPRS] ERROR: AT+CGDCONT failed");
+    net_diag("AT+CGDCONT", reply);
     return false;
   }
 
@@ -657,16 +952,17 @@ bool gprs_on() {
   delay(500);
 
   DEBUG.println("[GPRS] Activating PPP link (AT+XIIC=1) ...");
-  if (!gsm_send_at("AT+XIIC=1", "OK", AT_LONG_TIMEOUT)) {
+  if (!gsm_send_at("AT+XIIC=1", "OK", AT_LONG_TIMEOUT, &reply)) {
     ERR.println("[GPRS] ERROR: AT+XIIC=1 failed");
+    net_diag("AT+XIIC=1", reply);
     return false;
   }
   delay(1000);  // let IP assignment settle
 
   // Verify connection and read assigned IP
-  String reply;
   if (!gsm_send_at("AT+XIIC?", "+XIIC:", 5000, &reply)) {
     ERR.println("[GPRS] ERROR: AT+XIIC? no response");
+    net_diag("AT+XIIC?", reply);
     return false;
   }
 
@@ -674,8 +970,25 @@ bool gprs_on() {
   int idx = reply.indexOf("+XIIC:");
   if (idx == -1) {
     ERR.println("[GPRS] ERROR: unexpected format");
+    net_diag("AT+XIIC?", reply);
     return false;
   }
+  // "+XIIC:    1,10.1.2.3": state 1 and a real IP = connected. State 0 or
+  // 0.0.0.0 = attached without an IP, the case the APN verdict explains.
+  {
+    String xl = at_line(reply, "+XIIC:");
+    int sp = 6;  // after "+XIIC:"
+    while (sp < (int)xl.length() && xl[sp] == ' ') sp++;
+    bool state1 = sp < (int)xl.length() && xl[sp] == '1';
+    if (!state1 || xl.indexOf("0.0.0.0") != -1) {
+      ERR.print("[GPRS] ERROR: no IP (");
+      ERR.print(xl);
+      ERR.println(")");
+      net_diag("AT+XIIC? (no IP)", reply);
+      return false;
+    }
+  }
+  g_net_diag_logged = false;  // next failure gets diagnostics again
   INFO.println(reply.c_str());
   // String val = reply.substring(idx + 4);
   // val.trim();
@@ -1365,35 +1678,97 @@ void gps_check_timeout() {
     gps.location.isValid() && gps.satellites.isValid() && (gps.satellites.value() > MIN_SAT);
 
 
-  if (validFix) {
-    gpsNoFixTimerRunning = false;
-    g_status.is_gps_ready = 1;
-    return;
-  }
-
-  if (!gpsNoFixTimerRunning) {
-    gpsNoFixStart = millis();
-    gpsNoFixTimerRunning = true;
-
-    DEBUG.println(
-      "[GPS] No valid fix - timer started");
-
-    return;
-  }
-
-
-  if (millis() - gpsNoFixStart >= GPS_NO_FIX_TIMEOUT_MS) {
-    DEBUG.println(
-      "[GPS] No valid fix for 10 minutes System restart");
+  // No fix alone is normal indoors and never reboots (it used to, every
+  // 10 min, resetting the step total). Reboot only if the GPS UART has been
+  // silent for GPS_SILENT_TIMEOUT_MS: the module is dead or unpowered.
+  // Checked before the fix test: TinyGPS++ keeps isValid() true forever
+  // after the first fix, so a GPS that dies later must still be caught.
+  if (millis() - g_gps_rx_ms >= GPS_SILENT_TIMEOUT_MS) {
+    ERR.println("[GPS] No NMEA data from the GPS for 10 minutes - system restart");
     ldo_enable(false);
-    gpsNoFixTimerRunning = false;
-    gpsNoFixStart = millis();
     delay(2000);
+    noInterrupts();  // save last, so steps counted during the delay are kept
+    persist_save(g_steps.steps_total + g_steps.step_isr_count);
     gpsreset_magic = GPS_RESET_MAGIC;
     NVIC_SystemReset();
     while (1)
       ;
   }
+
+  if (validFix) {
+    g_status.is_gps_ready = 1;
+    return;
+  }
+}
+
+/** Track NMEA traffic for the silence check. Call after feeding gps. */
+static void gps_note_rx() {
+  uint32_t chars = gps.charsProcessed();
+  if (chars != g_gps_chars_seen) {
+    g_gps_chars_seen = chars;
+    g_gps_rx_ms = millis();
+  }
+}
+
+/** Decode whatever the GPS UART has buffered. Cheap; called from the AT
+ *  wait loop and loop() so NMEA is not lost (64-byte RX buffer) while
+ *  loop() is busy with the modem. */
+void gps_pump() {
+  while (SerialGPS.available()) gps.encode(SerialGPS.read());
+  gps_note_rx();
+}
+
+/** Satellites in view for one GSV talker, or -1 if not seen in the last minute. */
+static int gsv_in_view(TinyGPSCustom &c) {
+  if (!c.isValid() || c.age() > GPS_STATUS_INTERVAL_MS + 5000UL) return -1;
+  return atoi(c.value());
+}
+
+/**
+ * Once a minute: is NMEA data arriving, how many satellites are in view, is
+ * there a fix. Separates "no data" (cable, power, UART) from "no fix"
+ * (antenna, sky view). Call from loop().
+ */
+void gps_status_minute() {
+  static uint32_t last_ms = 0, last_chars = 0, last_ok = 0, last_bad = 0;
+  uint32_t now = millis();
+  if (now - last_ms < GPS_STATUS_INTERVAL_MS) return;
+  uint32_t secs = (now - last_ms) / 1000UL;
+  last_ms = now;
+
+  uint32_t chars = gps.charsProcessed(), ok = gps.passedChecksum(), bad = gps.failedChecksum();
+  uint32_t d_chars = chars - last_chars, d_ok = ok - last_ok, d_bad = bad - last_bad;
+  last_chars = chars;
+  last_ok = ok;
+  last_bad = bad;
+
+  int v[5] = { gsv_in_view(gsv_gp), gsv_in_view(gsv_gl), gsv_in_view(gsv_ga), gsv_in_view(gsv_bd), gsv_in_view(gsv_gb) };
+  const char *name[5] = { "GP", "GL", "GA", "BD", "GB" };
+  int in_view = 0;
+  bool any_gsv = false;
+  char line[200];
+  int n = snprintf(line, sizeof(line), "[GPS] %lus: chars +%lu, sentences ok +%lu bad +%lu | in view",
+                   (unsigned long)secs, (unsigned long)d_chars, (unsigned long)d_ok, (unsigned long)d_bad);
+  for (int i = 0; i < 5 && n > 0 && n < (int)sizeof(line); i++) {
+    if (v[i] >= 0) {
+      in_view += v[i];
+      any_gsv = true;
+    }
+    n += snprintf(line + n, sizeof(line) - n, v[i] >= 0 ? " %s %d" : " %s -", name[i], v[i]);
+  }
+  bool fix = gps.location.isValid() && gps.location.age() < 5000;
+  int used = (gps.satellites.isValid() && gps.satellites.age() < 5000) ? (int)gps.satellites.value() : 0;
+  if (n > 0 && n < (int)sizeof(line))
+    snprintf(line + n, sizeof(line) - n, " | used %d | fix %s", used, fix ? "yes" : "no");
+  INFO.println(line);
+
+  INFO.print("[GPS] verdict: ");
+  if (d_chars == 0) INFO.println("NO DATA from the GPS (check J1 cable, GPS power, UART PB8/PB9)");
+  else if (d_ok == 0) INFO.println("bytes arrive but no valid NMEA (baud rate or wiring noise)");
+  else if (fix) INFO.println("fix OK");
+  else if (!any_gsv) INFO.println("NMEA OK, no GSV sentences seen (satellites in view unknown), no fix");
+  else if (in_view == 0) INFO.println("NMEA OK, 0 satellites in view -> antenna or no sky view");
+  else INFO.println("NMEA OK, satellites in view but no fix yet (weak signal: passive chip antenna, indoors?)");
 }
 
 /** Feed NMEA bytes into TinyGPSPlus for duration_ms milliseconds */
@@ -1403,6 +1778,7 @@ void gps_feed(uint32_t duration_ms) {
     while (SerialGPS.available()) gps.encode(SerialGPS.read());
     delay(10);
   }
+  gps_note_rx();
 
   g_status.is_gps_ready = 0;
   // g_loc.current_lat = 0.0f;
@@ -1815,24 +2191,18 @@ void oneminute_timer_callback() {
   g_steps.minute_counter++;
   if (g_steps.minute_counter > 10000) g_steps.minute_counter = 0;
 
-  // ── Debug heartbeat (matches your TimerMin console output) ────────────────
-  INFO.println("+------------------------------+");
-  INFO.print("| Minute counter: ");
-  INFO.println(g_steps.minute_counter);
-  INFO.println("+------------------------------+");
+  persist_save(g_steps.steps_total);  // survives a software reset (item 3)
 
-  INFO.print("GSM Status: ");
-  DEBUG.println(g_status.gprs_connected ? "Connected" : "Disconnected");
-  INFO.print("GPS Status: ");
-  DEBUG.println(gps.location.isValid() ? "Valid fix" : "No fix");
-
-  INFO.println("+------------------------------+");
-  INFO.print("Steps in last minute: ");
-  INFO.println(g_steps.steps_this_min);
-  INFO.print("Steps total: ");
-  INFO.println(g_steps.steps_total);
-  accel_steps_print_status(INFO);
-  INFO.println("+------------------------------+");
+  // ── Report snapshot: printed by minute_report_service() from loop() ───────
+  // No Serial output in this ISR: loop() prints on the same UART and
+  // HardwareSerial is not safe to use from two contexts at once.
+  MinuteReport r = {};
+  r.minute = g_steps.minute_counter;
+  r.steps_min = cnt;
+  r.steps_total = g_steps.steps_total;
+  r.gprs = g_status.gprs_connected;
+  r.gps_fix = gps.location.isValid();
+  r.sleep_on = g_steps.sleep_mode_on;
 
   // // ── Inactivity → flag sleep (loop() calls enter_sleep() safely) ───────────
   // if (cnt == 0 && g_steps.is_inactive()) {
@@ -1842,10 +2212,8 @@ void oneminute_timer_callback() {
 
   if (!g_steps.sleep_mode_on) {
     g_steps.sleep_minute_count++;
-    DEBUG.print("[TIMER] Idle time: minute ");
-    DEBUG.print(g_steps.sleep_minute_count);
-    DEBUG.print("/");
-    DEBUG.println(IDLE_TIME);
+    r.idle_counted = true;
+    r.idle_minute = g_steps.sleep_minute_count;
     if (g_steps.sleep_minute_count >= IDLE_TIME) {
       // Time to evaluate
       bool no_steps = (cnt == 0);
@@ -1858,14 +2226,11 @@ void oneminute_timer_callback() {
           g_loc.current_lat, g_loc.current_lon);
       }
       bool no_movement = !has_gps || (dist < WAKE_MIN_DISTANCE_M);
-      DEBUG.print("[TIMER] — in last minute steps: ");
-      DEBUG.print(cnt);
-      DEBUG.print("  dist from sleep pos: ");
-      DEBUG.print(dist, 1);
-      DEBUG.println(" m");
+      r.evaluated = true;
+      r.dist_dm = (uint32_t)(dist * 10.0);
       if (no_movement && no_steps) {
         // Neither steps nor meaningful GPS movement since last sleep — sleep again
-        DEBUG.println("[TIMER]  flagging sleep.");
+        r.flagged_sleep = true;
         g_steps.sleep_mode_on = true;
         g_steps.send_sleep_data = true;
         g_steps.sleep_minute_count = 0;
@@ -1875,7 +2240,6 @@ void oneminute_timer_callback() {
         wake_count = 0;
 
       } else {
-        DEBUG.println("[TIMER] activity detected — updating ref, resetting window.");
         if (has_gps) {
           // Update sleep ref so next window measures from here
           g_steps.sleep_ref_lat = g_loc.current_lat;
@@ -1883,6 +2247,64 @@ void oneminute_timer_callback() {
         }
       }
     }
+  }
+
+  if (g_minute_report_due) g_minute_reports_missed++;  // loop() was busy for > 1 min
+  g_minute_report = r;
+  g_minute_report_due = true;
+}
+
+/** Prints the latest minute report. Called from loop() and from the AT wait
+ *  loop, never from an interrupt. */
+void minute_report_service() {
+  if (!g_minute_report_due) return;
+  noInterrupts();
+  MinuteReport r = g_minute_report;
+  uint32_t missed = g_minute_reports_missed;
+  g_minute_reports_missed = 0;
+  g_minute_report_due = false;
+  interrupts();
+
+  INFO.println();
+  INFO.println("+------------------------------+");
+  INFO.print("| Minute counter: ");
+  INFO.println(r.minute);
+  INFO.println("+------------------------------+");
+  INFO.print("GSM Status: ");
+  INFO.println(r.gprs ? "Connected" : "Disconnected");
+  INFO.print("GPS Status: ");
+  INFO.println(r.gps_fix ? "Valid fix" : "No fix");
+  INFO.println("+------------------------------+");
+  INFO.print("Steps in last minute: ");
+  INFO.println(r.steps_min);
+  INFO.print("Steps total: ");
+  INFO.println(r.steps_total);
+  if (missed) {
+    INFO.print("(");
+    INFO.print(missed);
+    INFO.println(" earlier minute report(s) not printed: loop() was busy; totals above include them)");
+  }
+  accel_steps_print_status(INFO);
+#if STEPS_DEBUG
+  accel_steps_print_debug(INFO);
+#endif
+  INFO.println("+------------------------------+");
+  if (r.idle_counted) {
+    DEBUG.print("[TIMER] Idle time: minute ");
+    DEBUG.print(r.idle_minute);
+    DEBUG.print("/");
+    DEBUG.println(IDLE_TIME);
+  }
+  if (r.evaluated) {
+    DEBUG.print("[TIMER] — in last minute steps: ");
+    DEBUG.print(r.steps_min);
+    DEBUG.print("  dist from sleep pos: ");
+    DEBUG.print(r.dist_dm / 10);
+    DEBUG.print(".");
+    DEBUG.print(r.dist_dm % 10);
+    DEBUG.println(" m");
+    DEBUG.println(r.flagged_sleep ? "[TIMER]  flagging sleep."
+                                  : "[TIMER] activity detected — updating ref, resetting window.");
   }
 }
 
@@ -2085,6 +2507,8 @@ void setup() {
   SerialDBG.begin(DBG_BAUD);
   delay(200);
   INFO.println("[SETUP]: === STM32G071CB — N706 GSM / G7A GPS Tracker ===");
+  INFO.print("[SETUP]: firmware ");
+  INFO.println(APP_VERSION);
   if (gpsreset_magic == GPS_RESET_MAGIC) {
     /*
          * Clear immediately.
@@ -2092,6 +2516,36 @@ void setup() {
     gpsreset_magic = 0;
     DEBUG.println("System reset reason : GPS");
   }
+
+  // Reset cause (RCC_CSR), then clear the flags for the next reset.
+  uint32_t csr = RCC->CSR;
+  RCC->CSR |= RCC_CSR_RMVF;
+  INFO.print("[SETUP] reset cause:");
+  if (csr & RCC_CSR_PWRRSTF) INFO.print(" POWER/BROWN-OUT");
+  if (csr & RCC_CSR_PINRSTF) INFO.print(" PIN");
+  if (csr & RCC_CSR_SFTRSTF) INFO.print(" SOFTWARE");
+  if (csr & RCC_CSR_IWDGRSTF) INFO.print(" IWDG");
+  if (csr & RCC_CSR_WWDGRSTF) INFO.print(" WWDG");
+  if (csr & RCC_CSR_LPWRRSTF) INFO.print(" LOW-POWER");
+  if (csr & RCC_CSR_OBLRSTF) INFO.print(" OPTION-BYTES");
+  INFO.println();
+
+  // Step total from before a software reset (item 3).
+  if (g_steps_persist.magic == STEPS_PERSIST_MAGIC &&
+      g_steps_persist.steps_total_inv == ~g_steps_persist.steps_total) {
+    g_steps.steps_total = g_steps_persist.steps_total;
+    g_steps.previous_steps = g_steps.steps_total;
+    g_steps_persist.restores++;
+    INFO.print("[SETUP] Step total restored after reset: ");
+    INFO.print(g_steps.steps_total);
+    INFO.print(" (restore #");
+    INFO.print(g_steps_persist.restores);
+    INFO.println(")");
+  } else {
+    g_steps_persist.restores = 0;
+    INFO.println("[SETUP] No saved step total (power-up): starting at 0");
+  }
+  persist_save(g_steps.steps_total);
   //========================================================================
   pinMode(CHRG_PIN, INPUT_PULLUP);
   pinMode(STDBY_PIN, INPUT_PULLUP);
@@ -2108,6 +2562,7 @@ void setup() {
   // LowPower.begin();
 
   lis2dh_init();
+  accel_steps_check_irq_priorities(INFO);
   g_steps.last_active_ms = millis();
   oneminute_timer_init();
 
@@ -2124,10 +2579,7 @@ void setup() {
         INFO.println("[SETUP] Modem OK.");
       } else {
         DEBUG.println("[SETUP] Modem check failed — power cycling ...");
-        gsm_power_off();
-        delay(2000);
-        gsm_power_on();
-        delay(3000);
+        modem_recover();
         g_status.print();
         continue;  // restart from top of while
       }
@@ -2173,6 +2625,9 @@ void setup() {
 // ═════════════════════════════════════════════════════════════════════════════
 
 void loop() {
+  minute_report_service();
+  gps_pump();
+  gps_status_minute();
   printChargeStatus();
   adc_print();
   // if (is_charging && (!g_steps.send_sleep_data)) {
@@ -2211,10 +2666,7 @@ void loop() {
 
           } else {
             ERR.println("[MAIN] Modem lost — power cycling ...");
-            gsm_power_off();
-            delay(2000);
-            gsm_power_on();
-            delay(3000);
+            modem_recover();
             g_status.print();
             return;
           }

@@ -26,7 +26,24 @@ void accel_steps_on_steps(uint32_t steps);
  * the timer keeps retrying every 5 s). */
 bool accel_steps_begin(TwoWire &wire, uint32_t sa0_pin);
 
-/* One status line: sensor state, steps counted, errors. */
+/* One status line: sensor state, steps counted, errors. Call from loop(). */
 void accel_steps_print_status(Print &out);
+
+/* Prints the interrupt priorities the FIFO read depends on and returns
+ * false if they are wrong (see accel_steps.cpp). Call once after begin(). */
+bool accel_steps_check_irq_priorities(Print &out);
+
+/* STEPS_DEBUG 1: the TIM17 interrupt also collects step counter statistics
+ * (bursts, candidates, reject reasons, max |a|, gravity estimate), and
+ * accel_steps_print_debug() prints them as one [STEPS] line and starts a
+ * new period. Costs one integer square root per sample and ~60 bytes of
+ * RAM. Set to 0 to remove it. */
+#ifndef STEPS_DEBUG
+#define STEPS_DEBUG 1
+#endif
+
+#if STEPS_DEBUG
+void accel_steps_print_debug(Print &out);
+#endif
 
 #endif
