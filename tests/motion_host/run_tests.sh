@@ -49,3 +49,23 @@ check_rec recordings/2026-10-31/walk1_s1_still.csv 0 0
 check_rec recordings/2026-10-31/walk1_s2_walk.csv 110 140    # truth "more than 100", not counted exactly
 check_rec recordings/2026-10-31/walk2_s1_walk100.csv 92 104  # truth 100 steps
 check_rec recordings/2026-10-31/sit1_walk100_taps_jiggle_walk102.csv 186 206  # truth 202, sitting parts 0
+
+echo "== Real recordings through the main firmware path (native 25 Hz, FIFO, 10-bit)"
+# Same ranges as above: the main firmware must count like the bring-up path.
+# Both phases = keeping the even or the odd 50 Hz samples.
+${CC:-cc} $CFLAGS -Wno-conversion "$HOST/main_path_replay.c" "$HOST/fake_lis2dh12.c" "$SRC/lis2dh12.c" \
+    "$SRC/step_counter.c" -o "$OUT/main_path_replay"
+# main_path_replay also checks the STEPS_DEBUG bookkeeping (step_debug.h)
+# against the counter's own totals and fails if they disagree.
+check_main() {   # file min max
+    for ph in 0 1; do
+        out=$("$OUT/main_path_replay" "$ROOT/$1" $ph) || { echo "  FAIL $1 (phase $ph): main_path_replay error"; exit 1; }
+        n=$(echo "$out" | head -1 | awk '{print $2}')
+        if [ "$n" -ge "$2" ] && [ "$n" -le "$3" ]; then echo "  ok   $1 (phase $ph): $n steps ($2..$3)"
+        else echo "  FAIL $1 (phase $ph): $n steps, expected $2..$3"; exit 1; fi
+    done
+}
+check_main recordings/2026-10-31/walk1_s1_still.csv 0 0
+check_main recordings/2026-10-31/walk1_s2_walk.csv 110 140
+check_main recordings/2026-10-31/walk2_s1_walk100.csv 92 104
+check_main recordings/2026-10-31/sit1_walk100_taps_jiggle_walk102.csv 186 206
