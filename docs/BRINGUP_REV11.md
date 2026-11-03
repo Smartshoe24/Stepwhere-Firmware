@@ -23,6 +23,7 @@ Result words: **PASS** = works as expected, **FAIL** = does not work,
 | T6 | 2026-10-31 | Re-check IC1 middle pins at the pads (modem on) | **FAIL: VCCB (pin 7) = 0 V.** VCCA 1.8 V, OE 1.8 V, GND 0 V are correct. Root cause of "no AT answer" |
 | T7 | 2026-10-31 | Continuity and voltages around IC1 pin 7 / R38 | Done: R38 (empty) sits between VCCB and GND; no 3.3 V feed for VCCB found |
 | T8 | 2026-10-31 | Same measurements on an old working board (R38 also empty there) | OPEN |
+| T9 | 2026-11-03 | Owner's LIS2DS12 firmware on Rev11, running log | GSM + GPRS + HTTP work now. New problems: server 404 (IMEI not bound), battery ADC saturated (raw 4095), no GPS fix |
 
 ## T0: Already known before this log (from the handoff)
 
@@ -522,3 +523,48 @@ Asked the owner to measure on the old board, while it runs and is connected
 to GSM: IC1 pins 3, 6, 7, and both R38 pads; and with the battery off: beep
 IC1 pin 7 to 3V3 and to GND. Plus: board revision marking, same modem
 (N706B-CN)? No soldering on Rev11 until this is known.
+
+## T9: owner's LIS2DS12 firmware on Rev11, running log (2026-11-03)
+
+Log of about 6 minutes from loop() (start-up part not included). Not yet
+known: what was changed on the board since T7 (VCCB wire soldered?), and
+whether this is the same Rev11 board.
+
+What works now (**PASS**):
+
+* Modem answers every AT command; IMEI `869938082392680` is read.
+* GPRS: `AT+XIIC?` -> `1,100.92.138.47` (later `100.94.118.135`).
+* HTTP: the modem opens the connection, sends the JSON and receives the
+  server's answer. The board reaches the internet.
+
+So the UART / level shifter problem from T2-T7 is gone on this board.
+
+Problems seen:
+
+1. **Server answers `404 Not Found`, `"No active child-device binding
+   found."`** (every POST). The request arrives; the backend rejects it
+   because IMEI 869938082392680 is not linked to a child/user account.
+   This is a backend registration issue, not hardware or firmware. Side
+   effect in the firmware: every non-201 counts as a failure, and after 5
+   failures it tears down and re-opens GPRS (`HTTP failed — marking GPRS for
+   reconnect`), about every 30 s. Firmware improvement for later: treat 4xx
+   as "server rejected", not as "network down".
+2. **Battery ADC saturated: `vBAT raw 4095`, `6.56 V`.** 4095 is the
+   12-bit maximum, so PB10 is at or above VDDA (3.28 V). With the 1:2
+   divider the firmware assumes, 6.56 V is impossible for a Li-ion cell.
+   In T2 the same firmware on this board read raw 2397 = 3.87 V, which was
+   correct. So something changed since T2: divider resistor missing or
+   lifted (soldering near it?), PB10 now touching a higher voltage, or the
+   charger input connected. Consequences: battery always reported as 100 %,
+   and the low-battery protection (`MIN_BAT_VOLT`, `BATTERY_LOW_OFF`) can
+   never trigger, so the cell can be over-discharged. Must be fixed.
+3. **No GPS fix, 0 satellites.** In T4 the GPS UART sent 0 bytes, and J1
+   (GPS connector) was empty in the photos. Not checked since.
+4. `signalStrength` is always 0 (firmware does not fill it in; minor).
+5. Cut-off server answers in the log (`Connectund."}`): the 64-byte UART
+   receive buffer overflows while the firmware prints. Cosmetic only, the
+   `404` status line is complete.
+
+Next: owner tells what was changed; multimeter: battery at BAT/GND and the
+voltage on the battery divider (PB10 side); backend: bind the IMEI; GPS
+check (`g` key in `modem_power_test`, J1 cable).
