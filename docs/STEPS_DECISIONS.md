@@ -23,6 +23,11 @@ is made; never delete one, mark it "Replaced by S-xx" instead. Context:
 | S-16 | 2026-10-31 | When a walk resumes after a pause of 1.6-2.7 stride intervals, count one extra stride (the turn) | walk2 (100 steps in a room): every turn is a pivot with no clear swing, 5 per 100 steps; board counted 86. With this: 94 | Lower thresholds to catch the pivot (would admit fidgets) |
 | S-17 | 2026-10-31 | Main firmware: LIS2DS12 code replaced by `stepwhere/accel_steps.cpp`. 25 Hz, 10-bit, +-8 g, FIFO read by TIM17 every 500 ms from its interrupt; each detected step does what the old INT2 ISR did (`accel_steps_on_steps`) | loop() blocks for seconds in GSM/GPS waits; the 32-sample FIFO lasts 1.28 s at 25 Hz, so reading from loop() would lose data. Wire works from a priority-3 timer ISR (I2C IRQ 2, SysTick 0). Minute timer, sleep logic and JSON unchanged | Reading in loop(); INT1 watermark ISR (one missed edge stalls it) |
 | S-18 | 2026-10-31 | Test build without OTA, linked at 0x08000000, APP_VERSION "v1.2-lis2dh12"; OTA added later | Owner: test the sensor change first, OTA separately | Build on PR #1 |
+| S-19 | 2026-11-03 | Keep the FIFO read in the TIM17 ISR (S-17). Guarded: `#error` in `accel_steps.cpp` if the core's I2C / SysTick priority is not more urgent than the timer priority, and the real NVIC values are printed at start | Checked in STM32duino 2.12.0 source: SysTick 0, UART 1, I2C 2, timers 3 (Cortex-M0+). The 17-min log on `main` shows 24.5 Hz, 0 overruns, 0 I2C errors while loop() blocked ~14 s in each of 44 `AT+XIIC=1` calls | Reading in loop() (would overflow the 1.28 s FIFO in those waits) |
+| S-20 | 2026-11-03 | The 1-minute timer (TIM16) no longer prints from its ISR. It stores a snapshot; loop() and the AT wait loop print it (`minute_report_service`) | HardwareSerial is not safe from two contexts; the log showed mixed lines (`.+-----`) | Larger TX buffer (only hides it) |
+| S-21 | 2026-11-03 | `steps_total` is kept in `.noinit` RAM (magic + inverted copy) across software resets, saved every minute and before the GPS reboot | The GPS reboot reset the total to 0; brown-outs from the loose battery connector would too. `.noinit` lies after `_ebss` and before the heap in the 2.12.0 map (not zeroed) | Writing to the W25Q128 every minute (wear, more code) |
+| S-22 | 2026-11-03 | STEPS_DEBUG (default 1 in this test build): per-minute `[STEPS]` line with bursts, candidates, reject reasons, max \|a\|, max motion, gravity. No change to `step_counter.c` | Item 8: 0 steps while walking, 0 overruns, but no way to see why. The bookkeeping is in `step_debug.h`, shared by the firmware and `main_path_replay`; `run_tests.sh` checks it against the counter's own totals | Logging every burst (too much output over hours) |
+| S-23 | 2026-11-03 | `tests/motion_host/main_path_replay` replays recordings through the main firmware path (native 25 Hz, normal mode, FIFO watermark 24, 500 ms reads) and runs in `run_tests.sh` | The bring-up path averages 50 Hz pairs; the main firmware does not. Result: same counts (see `docs/STEPS_RESULTS.md`), so the data path is not the cause of item 8 | Only `step_replay --decimate 2` |
 | S-10 | 2026-10-30 | Proposed acceptance: walking/running within +-3 % over 100 steps; 0 steps in 5 min sitting; < 10 false steps per school hour | Measurable on recordings; owner asked for "best result, nothing while sitting". Not yet confirmed by the owner | No target |
 
 ## Board wiring (Rev10 Gerbers, `Hardware--Stepwhere` branch)
@@ -49,7 +54,11 @@ Open hardware items:
   ~3 mm from IC8 pin 1; not on the BOM). 0 R / ferrite / <= 100 R is fine.
   1 k would drop the sensor supply by 0.7-1.4 V whenever I2C pulls low,
   because the pull-ups hang on the same node.
-* IC7 pin 5 floats. NC on the LIS2DS12; reserved on the LIS2DH12 (tie to GND
-  in the next revision; check against the ST datasheet).
+* IC7 pin 5 floats. NC on the LIS2DS12; on the LIS2DH12 it is "Res"
+  (reserved), and ST says to connect it to GND
+  ([ST community answer](https://community.st.com/mems-sensors-48/what-is-the-res-pin-for-in-the-lis2dh12-mems-accelerometer-83491)).
+  The datasheet pin table could not be downloaded from the build sandbox; re-check
+  Table 2 of the datasheet before the layout. Rev12 fix in
+  `docs/REV12_HARDWARE_FIXES.md`. No rework on Rev11 unless sensor stalls appear.
 * The LIS2DS12 (1.62-1.98 V part) ran on 3.3 V on this board, outside its
   operating range. Not an issue for the LIS2DH12 (1.71-3.6 V).

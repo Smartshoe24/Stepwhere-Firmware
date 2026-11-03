@@ -126,7 +126,7 @@ Note: the debug output of `lis2dh12_bringup` never showed the GSM LDO turned on
 | File | Branch | What it is |
 |---|---|---|
 | `prebuilt/lis2dh12_bringup.bin` (v0.5) | feature/lis2dh12-steps | accelerometer + flash check, motion recorder (keys i d n x e t r h) |
-| `prebuilt/stepwhere_v1.2-lis2dh12.bin` | feature/lis2dh12-steps | main firmware v1.2 with LIS2DH12 step counter (accel_steps.cpp, TIM17 500 ms), no OTA, 0x08000000. **Not yet run on hardware** |
+| `prebuilt/stepwhere_v1.2-lis2dh12.bin` | feature/lis2dh12-steps | main firmware v1.2 with LIS2DH12 step counter (accel_steps.cpp, TIM17 500 ms), no OTA, 0x08000000. Now **v1.2-lis2dh12.2** (2026-11-03): [NET] / [GPS] / [STEPS] diagnostics, no GPS no-fix reboot, step total kept across resets, CFUN=1 on wake. The first version ran on Rev11 (17-min log on `main`: 0 steps while walked) |
 | `prebuilt/modem_probe.bin` | ota/foundation | N706B test: key `n` = power on, network, downloads; `m` = AT pass-through (`~~~` leaves). Good first GSM test |
 | `prebuilt/flash_selftest.bin` | ota/foundation | W25Q128 erase/write/read test (last 64 KB only) |
 | `stepwhere.zip` (v1.2 original) | main | the firmware that worked on the old boards |
