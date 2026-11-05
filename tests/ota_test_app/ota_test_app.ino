@@ -8,6 +8,8 @@
  *   u   receive a .ota file by XMODEM into the download slot, check it,
  *       and mark it PENDING (installed by the bootloader on the next reset)
  *   r   reset
+ *   s   W25Q128 flash self-test (last 64 KB only)
+ *   n   N706B modem probe;  m  AT pass-through to the modem (~~~ to leave)
  *   f   mark whatever is in the download slot PENDING without checking it
  *       (tests that the BOOTLOADER rejects bad files on its own)
  *   e   erase the boot metadata (back to "first boot")
@@ -293,12 +295,14 @@ static void help()
 {
     SerialDBG.println("Commands: i = OTA info, u = upload .ota by XMODEM, r = reset, e = erase metadata, h = help");
     SerialDBG.println("          f = mark download slot PENDING without checks (bootloader test)");
+    SerialDBG.println("          s = flash self-test, n = modem probe, m = AT pass-through");
 }
 
 /* ------------------------------------------------------------------------ */
 
 void setup()
 {
+    kit_probe_init();
     SerialDBG.begin(115200);
     delay(100);
     SerialDBG.println();
@@ -378,6 +382,9 @@ void loop()
         break;
     case 'e': case 'E': cmd_erase_meta(); break;
     case 'f': case 'F': cmd_force_pending(); break;
+    case 's': case 'S': kit_selftest(); break;
+    case 'n': case 'N': kit_probe(); break;
+    case 'm': case 'M': kit_passthrough(); break;
     case 'h': case 'H': case '?': help(); break;
     default: break;
     }
