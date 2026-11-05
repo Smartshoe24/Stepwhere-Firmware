@@ -140,7 +140,7 @@ static bool pr_network_up()
      pr_at("AT+XIIC=0", 3000);
      pr_at("AT+XIIC=1", 20000);
     for (int i = 0; i < 15; i++) {
-         pr_at("AT+XIIC?", 3000, "+XIIC:");
+         pr_at("AT+XIIC?", 3000, "OK");
         const char *p = strstr(g_pcap, "+XIIC:");
         if (p && strchr(p, '1') && strchr(p, '.')) return true;
         delay(2000);

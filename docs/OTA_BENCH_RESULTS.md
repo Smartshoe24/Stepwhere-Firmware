@@ -47,3 +47,12 @@ Open issue found
   while v1.0.0 was running. The bootloader trusts the stored version. Fix planned:
   compare the stored SHA-256 with the app in flash when backing up, and the app
   should report its own compiled-in version to the server.
+
+## New board, OTA test kit run 2026-11-05 (bootloader v0.2.2)
+
+T01-T09, T12: PASS (signature check 1.81 s, watchdog reset at 20 s).
+T10 power cut: SKIP (install finished before the battery was pulled, 3 tries;
+prompt now shown earlier). T11: not run (no ST-LINK during test).
+T13 modem: N706B-A07-STD-BZ_CN1X-008, SIM ready, CSQ 21, registered (CEREG 0,1),
+AT+XIIC=1 OK. Probe bug: it stopped reading at "+XIIC:" so the IP was never
+seen; fixed (wait for OK).

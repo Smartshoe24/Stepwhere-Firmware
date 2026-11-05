@@ -214,7 +214,8 @@ def t_power_cut(b: Board, ctx):
         print("!" * 64)
         time.sleep(2)
         b.send("r")
-        b.expect("backing up current app", timeout=30)
+        # Prompt as soon as the install starts: ~5 s window (check, backup, check, program)
+        b.expect("watchdog on", timeout=30)
         print("\n  >>> PULL THE BATTERY NOW <<<\n", flush=True)
         try:
             b.expect("Stepwhere bootloader", timeout=90)
@@ -222,7 +223,7 @@ def t_power_cut(b: Board, ctx):
             st = b.expect("\n", timeout=5)
         except Fail:
             raise Fail("board did not come back within 90 s after the cut")
-        if "PENDING" in st or "BACKING_UP" in st or "INSTALLING" in st:
+        if any(x in st for x in ("PENDING", "BACKING_UP", "INSTALLING")):
             b.expect("New firmware confirmed", timeout=60)
             b.wait_idle_app("1.1.0")
             return f"resumed from state {st.strip().split(',')[0]}, finished and confirmed (try {attempt})"
@@ -311,7 +312,8 @@ def t_modem(b: Board, ctx):
     notes = []
     notes.append("AT ok" if "AT+CGMR" in out and "OK" in out else "modem silent")
     notes.append("SIM ready" if "READY" in out else "SIM NOT ready")
-    notes.append("IP ok" if re.search(r"\+XIIC:\s*1,\s*\d+\.\d+", out) else "no IP")
+    ip = re.search(r"\+XIIC:\s*1\s*,\s*(\d+\.\d+\.\d+\.\d+)", out)
+    notes.append(f"IP {ip.group(1)}" if ip else "no IP")
     for name, mark in (("A", "Method A"), ("B", "Method B"), ("C", "Method C")):
         i = out.find(mark)
         part = ""

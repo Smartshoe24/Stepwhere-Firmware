@@ -143,7 +143,7 @@ static bool network_up()
     at("AT+XIIC=0", 3000);
     at("AT+XIIC=1", 20000);
     for (int i = 0; i < 15; i++) {
-        at("AT+XIIC?", 3000, "+XIIC:");
+        at("AT+XIIC?", 3000, "OK");
         const char *p = strstr(g_cap, "+XIIC:");
         if (p && strchr(p, '1') && strchr(p, '.')) return true;
         delay(2000);
