@@ -392,6 +392,17 @@ def main() -> int:
 
     only = set(args.only.upper().split(",")) if args.only else None
     rows = []
+    try:
+        serial.Serial(args.port, 115200, timeout=0.1).close()
+    except serial.SerialException:
+        import serial.tools.list_ports
+        ports = [p.device for p in serial.tools.list_ports.comports() if "usbserial" in p.device
+                 or "wchusbserial" in p.device or "SLAB" in p.device]
+        print(f"ERROR: cannot open {args.port}.")
+        print("  Is the USB-TTL plugged into the Mac? Is another program (bench console, screen) using it?")
+        print("  USB serial ports found now:", ", ".join(ports) if ports else "none")
+        return 1
+
     with open(log_path, "w") as log:
         b = Board(args.port, log)
         for tid, name, fn in TESTS:
