@@ -429,6 +429,9 @@ def main() -> int:
         print(f"ERROR: {e}")
         print("Is this the right key? It must match fingerprint", PROD_KEY_FP)
         return 1
+    if args.probe_host:   # accept "https://name/..." as well as "name"
+        args.probe_host = re.sub(r"^[a-z]+://", "", args.probe_host.strip()).split("/")[0].split(":")[0]
+        print(f"Probe target: http://{args.probe_host}/probe.bin -> this Mac port {args.probe_local_port}\n")
     ctx = {"f": files, "key": key, "probe_host": args.probe_host, "probe_local_port": args.probe_local_port,
            "bins": {"v1.1": os.path.join(kit, "app_bins", "testapp_v1.1.bin")}}
     print("  signature OK against the production public key\n")
