@@ -7,8 +7,44 @@
 #define GSM_PWRKEY PB13
 #define LDO_EN     PA10
 #define APN        "internet"
-#define TEST_HOST  "httpbin.org"
-#define TEST_PATH  "/range/600"
+/* Download target, changeable at run time with:  p <host> <port> <path>  */
+static char g_host[64] = "httpbin.org";
+static char g_path[64] = "/range/600";
+static unsigned g_port = 80;
+static char g_req[256];
+static size_t g_req_len;
+
+static void build_request()
+{
+    g_req_len = (size_t)snprintf(g_req, sizeof g_req,
+        "GET %s HTTP/1.1\r\nHost: %s\r\nRange: bytes=100-199\r\nUser-Agent: stepwhere-probe\r\nConnection: close\r\n\r\n",
+        g_path, g_host);
+}
+
+/* "p host port path" from the debug UART */
+void kit_set_target()
+{
+    char line[160];
+    size_t n = 0;
+    uint32_t t0 = millis();
+    while (millis() - t0 < 3000 && n < sizeof line - 1) {
+        wdg_kick();
+        if (!SerialDBG.available()) continue;
+        char c = (char)SerialDBG.read();
+        if (c == '\r' || c == '\n') { if (n) break; else continue; }
+        line[n++] = c;
+    }
+    line[n] = 0;
+    char h[64], pa[64];
+    unsigned po;
+    if (sscanf(line, " %63s %u %63s", h, &po, pa) == 3) {
+        strcpy(g_host, h); strcpy(g_path, pa); g_port = po;
+        SerialDBG.print("[probe] target set: http://");
+    } else {
+        SerialDBG.print("[probe] usage: p <host> <port> <path>   current: http://");
+    }
+    SerialDBG.print(g_host); SerialDBG.print(':'); SerialDBG.print(g_port); SerialDBG.println(g_path);
+}
 
 HardwareSerial SerialGSM(PA3, PA2);   // USART2 N706B
 static char g_pcap[6144];
@@ -149,56 +185,75 @@ static bool pr_network_up()
     return false;
 }
 
-static const char RAW_REQUEST[] =
-    "GET " TEST_PATH " HTTP/1.1\r\n"
-    "Host: " TEST_HOST "\r\n"
-    "Range: bytes=100-199\r\n"
-    "Connection: close\r\n"
-    "\r\n";
+static void pr_url(bool scheme)
+{
+    char cmd[200];
+    snprintf(cmd, sizeof cmd, "AT+HTTPPARA=url,\"%s%s%s\"", scheme ? "http://" : "", g_host, g_path);
+    pr_at(cmd, 3000);
+    snprintf(cmd, sizeof cmd, "AT+HTTPPARA=port,%u", g_port);
+    pr_at(cmd, 3000);
+}
 
-static void pr_method_a()
+static void pr_method_a(bool scheme)
 {
     SerialDBG.println();
-    SerialDBG.println("=== Method A: AT+HTTPACTION=0 (plain GET, whole file) ===");
-     pr_at("AT+HTTPPARA=url,\"http://" TEST_HOST TEST_PATH "\"", 3000);
-     pr_at("AT+HTTPPARA=port,80", 3000);
-     pr_at("AT+HTTPSETUP", 20000);
-     pr_at("AT+HTTPACTION=0", 20000, "+HTTPCLOSED", 3000);
-     pr_at("AT+HTTPCLOSE", 3000);
+    SerialDBG.print("=== Method A");
+    SerialDBG.print(scheme ? "1" : "2");
+    SerialDBG.println(scheme ? ": HTTPACTION=0, url with http:// ===" : ": HTTPACTION=0, url without http:// ===");
+    pr_url(scheme);
+    pr_at("AT+HTTPSETUP", 20000);
+    pr_at("AT+HTTPACTION=0", 25000, "+HTTPCLOSED", 5000);
+    pr_capture(3000, NULL, 1500);          /* anything arriving after CLOSED */
+    if (g_pcap_len) pr_dump(g_pcap, g_pcap_len);
+    pr_at("AT+HTTPCLOSE", 3000);
 }
 
 static void pr_method_b()
 {
     char cmd[40];
     SerialDBG.println();
-    SerialDBG.println("=== Method B: AT+HTTPACTION=99 (custom request with Range header) ===");
-     pr_at("AT+HTTPPARA=url,\"http://" TEST_HOST TEST_PATH "\"", 3000);
-     pr_at("AT+HTTPPARA=port,80", 3000);
-     pr_at("AT+HTTPSETUP", 20000);
-    snprintf(cmd, sizeof cmd, "AT+HTTPACTION=99,%u", (unsigned)(sizeof RAW_REQUEST - 1));
+    SerialDBG.println("=== Method B: HTTPACTION=99 (own request with Range header) ===");
+    pr_url(true);
+    pr_at("AT+HTTPSETUP", 20000);
+    snprintf(cmd, sizeof cmd, "AT+HTTPACTION=99,%u", (unsigned)g_req_len);
     if (pr_at(cmd, 5000, ">", 0)) {
         SerialDBG.println("  >> (raw request with Range: bytes=100-199)");
-        SerialGSM.print(RAW_REQUEST);
-        pr_capture(20000, "+HTTPCLOSED", 3000);
+        SerialGSM.print(g_req);
+        pr_capture(25000, "+HTTPCLOSED", 5000);
         pr_dump(g_pcap, g_pcap_len);
+        pr_capture(3000, NULL, 1500);
+        if (g_pcap_len) pr_dump(g_pcap, g_pcap_len);
     }
-     pr_at("AT+HTTPCLOSE", 3000);
+    pr_at("AT+HTTPCLOSE", 3000);
 }
 
 static void pr_method_c()
 {
-    char cmd[64];
+    char cmd[120];
     SerialDBG.println();
-    SerialDBG.println("=== Method C: raw TCP socket (AT+TCPSETUP / AT+TCPSEND) ===");
-     pr_at("AT+TCPSETUP=0," TEST_HOST ",80", 20000, "+TCPSETUP:", 0);
-    snprintf(cmd, sizeof cmd, "AT+TCPSEND=0,%u", (unsigned)(sizeof RAW_REQUEST - 1));
+    SerialDBG.println("=== Method C: raw TCP socket (TCPSETUP / TCPSEND) ===");
+    snprintf(cmd, sizeof cmd, "AT+TCPSETUP=0,%s,%u", g_host, g_port);
+    /* wait for the WHOLE result line, e.g. "+TCPSETUP: 0,OK" or "0,FAIL" */
+    pr_at(cmd, 30000, "+TCPSETUP: 0,", 0);
+    pr_capture(3000, "\n", 0);
+    pr_dump(g_pcap, g_pcap_len);
+    snprintf(cmd, sizeof cmd, "AT+TCPSEND=0,%u", (unsigned)g_req_len);
     if (pr_at(cmd, 5000, ">", 0)) {
         SerialDBG.println("  >> (raw request with Range: bytes=100-199)");
-        SerialGSM.print(RAW_REQUEST);
-        pr_capture(20000, "+TCPCLOSE", 3000);
+        SerialGSM.print(g_req);
+        pr_capture(25000, "+TCPCLOSE", 5000);
         pr_dump(g_pcap, g_pcap_len);
     }
-     pr_at("AT+TCPCLOSE=0", 3000);
+    pr_at("AT+TCPCLOSE=0", 3000);
+}
+
+static void pr_dns()
+{
+    char cmd[100];
+    SerialDBG.println();
+    SerialDBG.println("=== DNS lookup ===");
+    snprintf(cmd, sizeof cmd, "AT+DNS=\"%s\"", g_host);
+    pr_at(cmd, 15000, "+DNS", 2000);
 }
 
 void kit_probe()
@@ -207,7 +262,12 @@ void kit_probe()
     SerialDBG.println("################ N706B PROBE START ################");
     pr_power_on();
     if (pr_network_up()) {
-        pr_method_a();
+        build_request();
+        SerialDBG.print("[probe] target http://");
+        SerialDBG.print(g_host); SerialDBG.print(':'); SerialDBG.print(g_port); SerialDBG.println(g_path);
+        pr_dns();
+        pr_method_a(true);
+        pr_method_a(false);
         pr_method_b();
         pr_method_c();
     }

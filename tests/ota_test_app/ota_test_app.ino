@@ -295,7 +295,7 @@ static void help()
 {
     SerialDBG.println("Commands: i = OTA info, u = upload .ota by XMODEM, r = reset, e = erase metadata, h = help");
     SerialDBG.println("          f = mark download slot PENDING without checks (bootloader test)");
-    SerialDBG.println("          s = flash self-test, n = modem probe, m = AT pass-through");
+    SerialDBG.println("          s = flash self-test, n = modem probe, p = set probe URL, m = AT pass-through");
 }
 
 /* ------------------------------------------------------------------------ */
@@ -384,6 +384,7 @@ void loop()
     case 'f': case 'F': cmd_force_pending(); break;
     case 's': case 'S': kit_selftest(); break;
     case 'n': case 'N': kit_probe(); break;
+    case 'p': case 'P': kit_set_target(); break;
     case 'm': case 'M': kit_passthrough(); break;
     case 'h': case 'H': case '?': help(); break;
     default: break;

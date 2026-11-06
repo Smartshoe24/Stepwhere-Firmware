@@ -27,6 +27,7 @@ sys.path.insert(0, HERE)
 
 try:
     import serial
+    import serial.tools.list_ports
 except ImportError:
     sys.exit("needs pyserial:  python3 -m pip install --user pyserial")
 
@@ -305,22 +306,61 @@ def t_server(b, ctx):
 
 
 def t_modem(b: Board, ctx):
-    b.drain()
-    b.send("n")
-    b.expect("N706B PROBE START", timeout=10)
-    out = b.expect("N706B PROBE END", timeout=300)
+    host = ctx.get("probe_host")
+    srv = None
+    root = None
+    srv_log = None
+    try:
+        if host:
+            root = tempfile.mkdtemp(prefix="probe_")
+            pattern = bytes(ord("a") + i % 26 for i in range(600))
+            with open(os.path.join(root, "probe.bin"), "wb") as f:
+                f.write(pattern)
+            srv_log = os.path.join(root, "server.log")
+            srv = subprocess.Popen([sys.executable, os.path.join(HERE, "fw_server.py"), "--root", root,
+                                    "serve", "--port", str(ctx["probe_local_port"])],
+                                   stdout=subprocess.DEVNULL, stderr=open(srv_log, "w"))
+            time.sleep(1.5)
+            lp = ctx["probe_local_port"]
+            try:
+                c = http.client.HTTPConnection("127.0.0.1", lp, timeout=5)
+                c.request("GET", "/probe.bin")
+                body = c.getresponse().read()
+            except OSError:
+                body = b""
+            if body != pattern:
+                raise Fail(f"port {lp} on this Mac is used by another program; "
+                           f"use --probe-local-port 8099 and point the tunnel at that port")
+            b.drain()
+            b.send("p")
+            b.ser.write(f"{host} 80 /probe.bin\n".encode())
+            b.expect("target set", timeout=10)
+        b.drain()
+        b.send("n")
+        b.expect("N706B PROBE START", timeout=10)
+        out = b.expect("N706B PROBE END", timeout=400)
+    finally:
+        if srv:
+            srv.terminate()
+            time.sleep(0.5)
     notes = []
-    notes.append("AT ok" if "AT+CGMR" in out and "OK" in out else "modem silent")
     notes.append("SIM ready" if "READY" in out else "SIM NOT ready")
     ip = re.search(r"\+XIIC:\s*1\s*,\s*(\d+\.\d+\.\d+\.\d+)", out)
     notes.append(f"IP {ip.group(1)}" if ip else "no IP")
-    for name, mark in (("A", "Method A"), ("B", "Method B"), ("C", "Method C")):
+    for mark in ("Method A1", "Method A2", "Method B", "Method C"):
         i = out.find(mark)
         part = ""
         if i >= 0:
             j = out.find("=== Method", i + 10)
             part = out[i:j if j > 0 else len(out)]
-        notes.append(f"{name}:{'206' if ' 206 ' in part else ('data' if 'abcd' in part else '-')}")
+        got = "206" if " 206 " in part else ("200" if " 200 " in part else ("data" if "abcdefgh" in part else "-"))
+        notes.append(f"{mark.split()[1]}:{got}")
+    if srv_log:
+        with open(srv_log) as f:
+            reqs = [ln.strip() for ln in f if '"GET' in ln or '"HEAD' in ln]
+        b.log.write("\n---- requests seen by the Mac server ----\n" + "\n".join(reqs or ["(none)"]) + "\n")
+        notes.append(f"server saw {len(reqs)} request(s)")
+        shutil.rmtree(root, ignore_errors=True)
     return "see log; " + ", ".join(notes)
 
 
@@ -370,6 +410,9 @@ def main() -> int:
     ap.add_argument("--port", required=True)
     ap.add_argument("--key", required=True, help="your production signing key .pem")
     ap.add_argument("--only", help="comma list of test IDs to run, e.g. T02,T04")
+    ap.add_argument("--probe-host", help="tunnel host name (e.g. abc.a.free.pinggy.link) forwarding to this Mac; "
+                                         "T13 then downloads from a server on this Mac")
+    ap.add_argument("--probe-local-port", type=int, default=8080, help="local port the tunnel forwards to")
     args = ap.parse_args()
 
     kit = os.path.dirname(HERE)
@@ -386,7 +429,7 @@ def main() -> int:
         print(f"ERROR: {e}")
         print("Is this the right key? It must match fingerprint", PROD_KEY_FP)
         return 1
-    ctx = {"f": files, "key": key,
+    ctx = {"f": files, "key": key, "probe_host": args.probe_host, "probe_local_port": args.probe_local_port,
            "bins": {"v1.1": os.path.join(kit, "app_bins", "testapp_v1.1.bin")}}
     print("  signature OK against the production public key\n")
 
@@ -395,7 +438,6 @@ def main() -> int:
     try:
         serial.Serial(args.port, 115200, timeout=0.1).close()
     except serial.SerialException:
-        import serial.tools.list_ports
         ports = [p.device for p in serial.tools.list_ports.comports() if "usbserial" in p.device
                  or "wchusbserial" in p.device or "SLAB" in p.device]
         print(f"ERROR: cannot open {args.port}.")
