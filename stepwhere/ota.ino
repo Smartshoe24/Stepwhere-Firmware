@@ -7,7 +7,7 @@
 //    bootloader started is fed from service_background().
 //  - Once a day (and on 'o' from the debug UART): fetch
 //      /fw/devices/<IMEI>.json, else /fw/manifest.json
-//    from the ingest server. A newer, matching release is downloaded in 4 KB
+//    from the ingest server. A newer, matching release is downloaded in 1 KB
 //    byte ranges between uploads, checked (SHA-256 + signature), and, with
 //    enough battery, marked PENDING; the board then resets into the bootloader.
 //  - Every upload carries a "fw" status block.
@@ -23,6 +23,11 @@
 #define OTA_CHECK_INTERVAL_MS (24UL * 60UL * 60UL * 1000UL)
 #define OTA_RETRY_MS (30UL * 60UL * 1000UL)            // after a failed check
 #define OTA_CHUNK 4096u                                // one W25Q sector
+// Bytes per HTTP request. A 1 KB reply (+ ~300 B headers/framing) arrives in
+// ~110 ms and stays close to the 1 KB UART RX buffer; 4 KB replies lost bytes
+// on the live board (2341 of 4096 received).
+#define OTA_PART 1024u
+#define OTA_PART_RETRY_MS 3000UL                       // pause after a failed part
 #define OTA_MAX_CHUNK_FAILS 4
 #define OTA_MIN_BATTERY_V 3.70f                        // to mark an update PENDING
 #define OTA_HTTP_TIMEOUT_MS 40000UL
@@ -50,14 +55,17 @@ struct OtaClient {
   uint32_t dl_size = 0;        // whole .ota (header + payload)
   uint32_t dl_offset = 0;
   uint8_t dl_fails = 0;
+  uint32_t dl_next_at = 0;     // millis() before which no part is requested
   char dl_path[128] = "";
 } g_ota;
 
 #include "src/ota_util.h"
 
-// Raw modem bytes for one HTTP exchange: 4 KB body + headers + URC framing.
-static uint8_t g_ota_rx[OTA_CHUNK + 1024];
-static uint8_t g_ota_rx_copy[300];   // raw start of the last reply, for the log
+// Raw modem bytes for one HTTP exchange: 1 KB body (or the manifest) +
+// headers + URC framing.
+static uint8_t g_ota_rx[OTA_PART + 1024];
+static uint8_t g_ota_rx_copy[200];   // raw start of the last reply, for the log
+static uint8_t g_ota_rx_tail[120];   // raw end of the last reply, for the log
 
 // ----------------------------------------------------------------------------
 
@@ -179,12 +187,27 @@ void ota_append_status(JsonWriter &json) {
 //  HTTP GET through the N706B
 // ----------------------------------------------------------------------------
 
+static void ota_print_escaped(const uint8_t *p, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    uint8_t ch = p[i];
+    if (ch == '\r') INFO.print("\\r");
+    else if (ch == '\n') INFO.print("\\n");
+    else if (ch >= 32 && ch < 127) INFO.write(ch);
+    else { char hx[5]; snprintf(hx, sizeof hx, "\\x%02X", ch); INFO.print(hx); }
+  }
+}
+
 // GET path (Range if len > 0). On success body points into g_ota_rx.
 // Returns the HTTP status, or 0 on a transport failure.
 static int ota_http_get(const char *path, uint32_t from, uint32_t len,
                         const uint8_t **body, size_t *body_len) {
   char req[220], cmd[160];
   int n;
+  *body = nullptr;
+  *body_len = 0;
+  // Bytes left over from an earlier, cut-off reply would be read as the start
+  // of this one.
+  while (SerialGSM.available()) SerialGSM.read();
   if (len) n = snprintf(req, sizeof req,
                         "GET %s HTTP/1.1\r\nHost: " OTA_HOST "\r\nRange: bytes=%lu-%lu\r\n"
                         "User-Agent: stepwhere/" APP_VERSION "\r\nConnection: close\r\n\r\n",
@@ -205,16 +228,26 @@ static int ota_http_get(const char *path, uint32_t from, uint32_t len,
       size_t got = 0;
       const uint32_t started = millis();
       uint32_t last = millis();
+      const char *ended = "timeout";
       while (g_modem.rail_on && millis() - started < OTA_HTTP_TIMEOUT_MS) {
         while (SerialGSM.available() && got < sizeof g_ota_rx) {
           g_ota_rx[got++] = (uint8_t)SerialGSM.read();
           last = millis();
         }
-        if (got >= 12 && ota_find(g_ota_rx, got, "+HTTPCLOSED", got > 600 ? got - 600 : 0) >= 0) break;
-        if (got && millis() - last > 5000) break;   // quiet for 5 s
-        service_background();
+        if (got >= 12 && ota_find(g_ota_rx, got, "+HTTPCLOSED", got > 600 ? got - 600 : 0) >= 0) {
+          ended = "closed";
+          break;
+        }
+        if (got >= sizeof g_ota_rx) { ended = "buffer full"; break; }
+        if (got && millis() - last > 5000) { ended = "quiet 5 s"; break; }   // quiet for 5 s
+        // Run the other jobs (GPS, steps, minute log) only while the line is
+        // quiet: they can take longer than the ~90 ms the 1 KB UART buffer
+        // holds at 115200 baud, and bytes were lost that way.
+        if (!got || millis() - last > 50) service_background();
       }
       memcpy(g_ota_rx_copy, g_ota_rx, got < sizeof g_ota_rx_copy ? got : sizeof g_ota_rx_copy);
+      size_t tail = got < sizeof g_ota_rx_tail ? got : sizeof g_ota_rx_tail;
+      memcpy(g_ota_rx_tail, g_ota_rx + got - tail, tail);
       size_t plain = ota_unframe(g_ota_rx, got);
       long st = ota_find(g_ota_rx, plain, "HTTP/1.", 0);
       long hdr_end = ota_find(g_ota_rx, plain, "\r\n\r\n", 0);
@@ -231,19 +264,23 @@ static int ota_http_get(const char *path, uint32_t from, uint32_t len,
         *body = g_ota_rx + b;
         *body_len = bl;
       }
-      // Not a usable reply: show what the modem sent (first 300 bytes, escaped)
-      // so the exact +HTTPRECV framing can be seen on the TTL.
-      if (status != 200 && status != 206) {
+      // Not a usable reply (no status, unexpected status, or a short/long
+      // body): show how the read ended and the raw start and end of what the
+      // modem sent, escaped, so the +HTTPRECV framing can be seen on the TTL.
+      // A plain 404 (no per-device file) is expected and not dumped.
+      bool usable = (status == 200 || status == 206) && (!len || *body_len == len);
+      if (!usable && status != 404) {
         INFO.print("[OTA] Raw modem reply (");
         INFO.print((unsigned)got);
-        INFO.print(" bytes): ");
-        size_t shown = got < 300 ? got : 300;
-        for (size_t i = 0; i < shown; i++) {
-          uint8_t ch = g_ota_rx_copy[i];
-          if (ch == '\r') INFO.print("\\r");
-          else if (ch == '\n') INFO.print("\\n");
-          else if (ch >= 32 && ch < 127) INFO.write(ch);
-          else { char hx[5]; snprintf(hx, sizeof hx, "\\x%02X", ch); INFO.print(hx); }
+        INFO.print(" bytes, body ");
+        INFO.print((unsigned)*body_len);
+        INFO.print(", ended: ");
+        INFO.print(ended);
+        INFO.print("): ");
+        ota_print_escaped(g_ota_rx_copy, got < sizeof g_ota_rx_copy ? got : sizeof g_ota_rx_copy);
+        if (got > sizeof g_ota_rx_copy) {
+          INFO.print(" ... ");
+          ota_print_escaped(g_ota_rx_tail, tail);
         }
         INFO.println();
       }
@@ -325,6 +362,7 @@ static void ota_check() {
     g_ota.dl_offset = 0;
   }
   g_ota.dl_fails = 0;
+  g_ota.dl_next_at = millis();
   g_ota.phase = OTA_PH_DOWNLOAD;
 }
 
@@ -372,24 +410,30 @@ static void ota_download_chunk() {
     }
     return;
   }
+  if ((int32_t)(millis() - g_ota.dl_next_at) < 0) return;   // pause after a failed part
+  // 1 KB per request (OTA_PART), written straight into the slot. A 4 KB sector
+  // is erased when its first part is due, so later parts land on erased flash.
   uint32_t n = g_ota.dl_size - g_ota.dl_offset;
-  if (n > OTA_CHUNK) n = OTA_CHUNK;
+  if (n > OTA_PART) n = OTA_PART;
+  const uint32_t addr = EXT_SLOT_DOWNLOAD + g_ota.dl_offset;
+  if (g_ota.dl_offset % OTA_CHUNK == 0 && w25q_erase_sector(g_ota_flash.dev(), addr) != W25Q_OK) return;
   const uint8_t *body = nullptr;
   size_t blen = 0;
-  // Each chunk is one 4 KB sector: erase it first, so a retry after a
-  // half-written attempt starts clean.
-  if (w25q_erase_sector(g_ota_flash.dev(), EXT_SLOT_DOWNLOAD + g_ota.dl_offset) != W25Q_OK) return;
   int st = ota_http_get(g_ota.dl_path, g_ota.dl_offset, n, &body, &blen);
-  bool ok = (st == 206 || (st == 200 && g_ota.dl_offset == 0 && n == g_ota.dl_size)) && blen == n &&
-            w25q_write_verify(g_ota_flash.dev(), EXT_SLOT_DOWNLOAD + g_ota.dl_offset, body, n) == W25Q_OK;
+  bool got_ok = (st == 206 || (st == 200 && g_ota.dl_offset == 0 && n == g_ota.dl_size)) && blen == n;
+  bool ok = got_ok && w25q_write_verify(g_ota_flash.dev(), addr, body, n) == W25Q_OK;
   if (!ok) {
-    WARN.print("[OTA] Chunk at ");
+    WARN.print("[OTA] Part at ");
     WARN.print(g_ota.dl_offset);
     WARN.print(" failed (HTTP ");
     WARN.print(st);
     WARN.print(", ");
     WARN.print((unsigned)blen);
-    WARN.println(" bytes).");
+    WARN.println(got_ok ? " bytes, flash write failed)." : " bytes).");
+    // A failed write leaves the sector dirty: restart it from its first part,
+    // which erases it again. A failed download wrote nothing, so just retry.
+    if (got_ok) g_ota.dl_offset -= g_ota.dl_offset % OTA_CHUNK;
+    g_ota.dl_next_at = millis() + OTA_PART_RETRY_MS;
     if (++g_ota.dl_fails >= OTA_MAX_CHUNK_FAILS) {
       WARN.println("[OTA] Download paused; resumes at the next check.");
       g_ota.phase = OTA_PH_IDLE;
@@ -399,10 +443,12 @@ static void ota_download_chunk() {
   }
   g_ota.dl_fails = 0;
   g_ota.dl_offset += n;
-  INFO.print("[OTA] Downloaded ");
-  INFO.print(g_ota.dl_offset);
-  INFO.print("/");
-  INFO.println(g_ota.dl_size);
+  if (g_ota.dl_offset % OTA_CHUNK == 0 || g_ota.dl_offset >= g_ota.dl_size) {
+    INFO.print("[OTA] Downloaded ");
+    INFO.print(g_ota.dl_offset);
+    INFO.print("/");
+    INFO.println(g_ota.dl_size);
+  }
   if (g_ota.dl_offset >= g_ota.dl_size) ota_finish_download();
 }
 
