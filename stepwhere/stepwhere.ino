@@ -1,58 +1,173 @@
 /**
- * STM32G071CB — Neoway N706 GSM + G7A GPS
+ * Stepwhere tracker — final firmware
+ * STM32G070CB (Rev11) — Neoway N706 LTE + G7A GPS + LIS2DH12 accelerometer
  *
  * Pin Mapping:
  *   GSM TX/RX  : PA2 / PA3   (USART2)
  *   GPS TX/RX  : PB8 / PB9   (USART3)
- *   DEBUG      : PB6 / PB7   (USART1)
+ *   DEBUG      : PB6 / PB7   (USART1, 115200 baud TTL)
  *   GSM PWRKEY : PB13
- *   LDO_EN     : PA10
+ *   LDO_EN     : PA10        (shared GSM + GPS rail)
+ *   ACCEL      : I2C PA12 / PA11, SA0 PA1 (driven high -> 0x19)
+ *
+ * Start-up: rail on (GSM + GPS power together), PWRKEY, accelerometer, then
+ * AT -> SIM -> GPS UART -> IMEI -> data. Uploads start once data is up.
+ *
+ * Location, in priority order:
+ *   1. GPS   — a fresh fix (more than MIN_SAT satellites, under 5 s old).
+ *   2. Wi-Fi — no fix: an AT+WIFIAPSCAN with at least 2 usable access points.
+ *              The serving cell is sent with it, so if the Wi-Fi lookup finds
+ *              nothing the server's geolocation falls back to the cell.
+ *   3. GSM   — no fix and no usable Wi-Fi: the LTE serving cell (AT+NETDMSG).
+ *   Network positions are resolved to lat/long by the server.
+ *
+ * Steps: LIS2DH12 at 25 Hz into its FIFO, read every 500 ms from TIM17 by
+ * accel_steps.cpp and counted by the StepwhereMotion step counter.
  *
  * Libraries required:
- *   - TinyGPSPlus  (by Mikal Hart)
- *   - STM32duino core
+ *   - TinyGPSPlus 1.0.3, STM32duino core 2.12.0
+ *   - StepwhereMotion, StepwhereOTA (../libraries)
  *
  * AT command reference: Neoway N706 AT Commands Manual V1.0
  */
 
-#include <STM32TimerInterrupt.h>  //v1.3.0
 #include <Wire.h>
-#include <STM32_ISR_Timer.h>
 #include <HardwareSerial.h>
 #include <TinyGPSPlus.h>
-// #include "cert.h"
+#include <stdarg.h>
 
-// ─── Pin definitions ──────────────────────────────────────────────────────────
+#include "accel_steps.h"
+#include "src/radio_parsers.h"
+
+#define APP_VERSION "v2.1-lis2dh12"
+
+// Modem and GPS bytes keep arriving while the background service reads the
+// accelerometer; the 64-byte default overflows. Set by build_opt.h.
+#if SERIAL_RX_BUFFER_SIZE < 1024
+#error "Build with scripts/build-arduino.sh (needs SERIAL_RX_BUFFER_SIZE=1024 from build_opt.h)"
+#endif
+
+// ─── Pins ─────────────────────────────────────────────────────────────────────
 #define GSM_PWRKEY PB13
 #define LDO_EN PA10
-#define DEBUG_EN
+#define GSM_RX PA3
+#define GSM_TX PA2
+#define GPS_RX PB9
+#define GPS_TX PB8
 #define I2C_SDA PA12
 #define I2C_SCL PA11
-#define LIS2DS12_SA0 PA1
-#define LIS2DS12_INT1 PB3
-#define LIS2DS12_INT2 PB4
+#define ACCEL_SA0 PA1
 
 #define ADC_PIN PB10       // External analog input (ADC_IN8)
 #define ADC_VREF_CH AVREF  // Internal Vref channel (STM32 built-in)
-#define ADC_RESOLUTION 12  // 12-bit = 0..4095
-#define VREF_MV        3300.0f    // Supply / Vref voltage in mV
-#define MIN_BAT_VOLT   3.2f  // Minimum battery voltage 3.20
-#define BAT_RATIO      112      //100      //230
-/*
-* 143 == (100 /(4.2 - 3.5))
-* 112 == (100 / (4.1 - 3.2))
-*/
-
-#define BATTERY_LOW_OFF 3.40f
-#define BATTERY_LOW_ON 3.70f
-
-#define BMS_STATUS1 PB15  //No  battery charging status on controller
-#define BMS_STATUS2 PB14  //No  battery charging status on controller
+#define BATTERY_ADC_BITS 12  // 12-bit = 0..4095 (the core already defines ADC_RESOLUTION)
+#define MIN_BAT_VOLT 3.2f  // Minimum battery voltage 3.20
+#define BAT_RATIO 112
+// Checked between operations in loop() only: a reading taken while the modem
+// powers up or transmits sags under load and would cut a healthy battery.
+#define BATTERY_LOW_OFF 3.40f  // below this the modem/GPS rail is cut (v1.2)
+#define BATTERY_LOW_ON 3.70f   // and stays cut until the battery recovers (v1.2)
 
 #define CHRG_PIN PB14
 #define STDBY_PIN PB15
 
-typedef enum ChargeStatus {
+// ─── Baud rates ───────────────────────────────────────────────────────────────
+#define GSM_BAUD 115200
+#define GPS_BAUD 9600
+#define DBG_BAUD 115200
+
+// ─── Server ───────────────────────────────────────────────────────────────────
+#define APN "internet"
+#define SERVER_CMD "AT+HTTPPARA=url,\"http://ingest.stepwhere.in/location\""
+#define HTTP_PORT 80
+
+// ─── Timing ───────────────────────────────────────────────────────────────────
+#define AT_TIMEOUT 3000
+#define AT_LONG_TIMEOUT 15000
+#define HTTP_TIMEOUT 30000
+#define HTTP_REQ_DELAY 8000UL  // gap between the end of one upload and the next
+
+#define MODEM_AT_TIMEOUT_MS 30000UL
+#define SIM_READY_TIMEOUT_MS 60000UL
+#define SIM_RETRY_DELAY_MS 30000UL
+#define MODEM_RAIL_CYCLES 3                // rail cycles before backing off
+#define MODEM_RECOVERY_BACKOFF_MS 60000UL
+#define DATA_RETRY_DELAY_MS 5000UL
+#define DATA_FAILURES_BEFORE_RAIL_CYCLE 6
+#define HTTP_TRANSPORT_FAILURES_BEFORE_CHECK 5
+
+// ─── Location ─────────────────────────────────────────────────────────────────
+#define MIN_SAT 3                           // a fix needs more satellites than this
+#define GPS_FIX_MAX_AGE_MS 5000UL
+#define GPS_SILENT_RESTART_MS 120000UL      // no NMEA at all for this long → rail cycle
+#define GPS_SILENT_RESTART_HOLDOFF_MS (30UL * 60UL * 1000UL)
+
+#define WIFI_SCAN_INTERVAL_MS 60000UL       // server looks up at most once a minute
+#define WIFI_RESULT_MAX_AGE_MS 120000UL
+// Scans return ERROR while LTE is busy (attach, data activation, an upload) and
+// succeed on a quiet link, so each scan waits this long after data activity.
+#define WIFI_SCAN_QUIET_MS 12000UL
+#define WIFI_SCAN_RETRY_DELAY_MS 5000UL
+#define WIFI_SCAN_TIMEOUT_MS 30000UL
+// A timeout power cycles the shared rail (and the GPS); wait longer after one.
+#define WIFI_SCAN_TIMEOUT_BACKOFF_MS (10UL * 60UL * 1000UL)
+// The server's geolocation only uses Wi-Fi with at least this many usable APs.
+#define WIFI_MIN_USABLE_APS 2
+
+// ─── Activity / sleep ─────────────────────────────────────────────────────────
+#define MIN_STEPS 20  // steps within a minute that cancel sleep mode
+#define IDLE_TIME 5   // awake minutes before sleep is evaluated
+#define MINUTE_MS 60000UL
+#define WAKE_MIN_DISTANCE_M 15.0
+
+// ─── Logging ──────────────────────────────────────────────────────────────────
+#define LVL_NONE 0
+#define LVL_ERROR 1
+#define LVL_WARN 2
+#define LVL_INFO 3
+#define LVL_DEBUG 4
+
+#ifndef STEPWHERE_LOG_LEVEL
+#define STEPWHERE_LOG_LEVEL LVL_INFO
+#endif
+
+HardwareSerial SerialGSM(GSM_RX, GSM_TX);  // USART2 — Neoway N706
+HardwareSerial SerialGPS(GPS_RX, GPS_TX);  // USART3 — G7A GPS
+HardwareSerial SerialDBG(PB7, PB6);  // USART1 — Debug console
+
+// A disabled level compiles to dead code, so its strings never reach flash.
+// (A for-loop rather than if(0) keeps "if (x) INFO.print(); else ..." intact.)
+#define LOG_DISABLED for (; false;) SerialDBG
+
+#if STEPWHERE_LOG_LEVEL >= LVL_ERROR
+#define ERR SerialDBG
+#else
+#define ERR LOG_DISABLED
+#endif
+#if STEPWHERE_LOG_LEVEL >= LVL_WARN
+#define WARN SerialDBG
+#else
+#define WARN LOG_DISABLED
+#endif
+#if STEPWHERE_LOG_LEVEL >= LVL_INFO
+#define INFO SerialDBG
+#else
+#define INFO LOG_DISABLED
+#endif
+#if STEPWHERE_LOG_LEVEL >= LVL_DEBUG
+#define DEBUG SerialDBG
+#else
+#define DEBUG LOG_DISABLED
+#endif
+
+TwoWire dev_i2c(I2C_SDA, I2C_SCL);
+TinyGPSPlus gps;
+
+// =============================================================================
+//  STATE
+// =============================================================================
+
+enum ChargeStatus : uint8_t {
   CHARGE_UNKNOWN,
   CHARGE_CHARGING,
   CHARGE_COMPLETE,
@@ -60,2333 +175,1249 @@ typedef enum ChargeStatus {
   CHARGE_IDLE
 };
 
-struct vdd_mon {
-  int battery_level;
-  float bat_volt;
-  float vdd_volt;
-} g_vdd_mon;
+struct PowerState {
+  int battery_level = 0;
+  float bat_volt = 0.0f;
+  bool battery_low = false;
+  ChargeStatus charge = CHARGE_UNKNOWN;
+} g_power;
 
+struct ModemState {
+  bool rail_on = false;
+  uint32_t rail_on_at = 0;
+  bool at_ok = false;
+  bool functional = false;  // CFUN=1
+  bool sim_ready = false;
+  bool imei_valid = false;
+  bool data_connected = false;
+  uint8_t rail_cycles = 0;
+  uint8_t data_failures = 0;
+  uint8_t transport_failures = 0;
+  uint8_t stuck_link_checks = 0;   // transport checks that found a "valid" link
+  bool force_data_reactivate = false;
+  bool backoff = false;
+  uint32_t backoff_started = 0;
+  uint32_t backoff_ms = 0;
+  bool data_activity_seen = false;
+  uint32_t last_data_activity = 0;
+  char imei[16] = "";
 
-#define GPS_RESET_MAGIC 0xCAFE1234UL
-
-uint32_t gpsreset_magic
-  __attribute__((section(".noinit")));
-
-// ─── Serial port aliases ──────────────────────────────────────────────────────
-// STM32duino HardwareSerial constructor takes (RX_pin, TX_pin).
-
-HardwareSerial SerialGSM(PA3, PA2);  // USART2 — Neoway N706
-HardwareSerial SerialGPS(PB9, PB8);  // USART3 — G7A GPS
-HardwareSerial SerialDBG(PB7, PB6);  // USART1 — Debug console
-
-TwoWire dev_i2c(I2C_SDA, I2C_SCL);
-
-STM32Timer ITimer(TIM1);    // Init STM32 timer TIM1
-STM32_ISR_Timer ISR_Timer;  // Init STM32_ISR_Timer
-
-// #define INFO SerialDBG
-
-// #ifdef DEBUG_EN
-// #define DEBUG SerialDBG
-// #else
-// #define DEBUG
-// #endif
-
-
-#define LOG_SERIAL SerialDBG   // e.g. #define SerialDBG Serial
-
-// ---------------------------------------------------------------
-// Level values (higher = more verbose)
-// ---------------------------------------------------------------
-#define LVL_NONE    0
-#define LVL_ERROR   1
-#define LVL_WARN    2
-#define LVL_INFO    3
-#define LVL_DEBUG   4
-#define LVL_VERBOSE 5
-
-#define LOG_LEVEL LVL_DEBUG
-
-// Set active level (override with -D LOG_LEVEL=x in build flags)
-#ifndef LOG_LEVEL
-#define LOG_LEVEL LVL_INFO
-#endif
-
-class NullStream : public Print {
-public:
-  size_t write(uint8_t) override { return 1; }
-  size_t write(const uint8_t *buffer, size_t size) override { return size; }
-};
-
-NullStream nullStream;   // define once in a .cpp, see below
-
-
-#if LOG_LEVEL >= LVL_ERROR
-  #define ERR   LOG_SERIAL
-#else
-  #define ERR   nullStream
-#endif
-
-#if LOG_LEVEL >= LVL_WARN
-  #define WARN  LOG_SERIAL
-#else
-  #define WARN  nullStream
-#endif
-
-#if LOG_LEVEL >= LVL_INFO
-  #define INFO  LOG_SERIAL
-#else
-  #define INFO  
-#endif
-
-#if LOG_LEVEL >= LVL_DEBUG
-  #define DEBUG LOG_SERIAL
-#else
-  #define DEBUG nullStream
-#endif
-
-
-
-#define MIN_SAT 3
-#define GPS_NO_FIX_TIMEOUT_MS (10UL * 60UL * 1000UL)
-
-uint32_t gpsNoFixStart = 0;
-bool gpsNoFixTimerRunning = false;
-
-
-// ─── Baud rates ───────────────────────────────────────────────────────────────
-#define GSM_BAUD 115200
-#define GPS_BAUD 9600
-#define DBG_BAUD 115200
-
-// ─── Timeouts (ms) ───────────────────────────────────────────────────────────
-#define AT_TIMEOUT 3000
-#define AT_LONG_TIMEOUT 15000
-#define HTTP_TIMEOUT 30000
-
-//─── Power / location timer config ───────────────────────────────────────────
-#define CHECK_INTERVAL_MS 30000UL     // check location every 30000 seconds
-#define STATIONARY_LIMIT_MS 300000UL  // sleep after 5 min with no movement
-#define SLEEP_DURATION_S 300          // wake from RTC sleep after 5 minutes
-#define MOVE_THRESHOLD_M 10.0         // metres — below this = no movement
-
-#define MIN_STEPS 20  // min steps/min to cancel sleep mode
-#define IDLE_TIME 5
-#define STEP_INACTIVITY_LIMIT_MS 300000UL  // sleep after 5 min with no steps
-#define STEP_TIMER_INTERVAL_MS 60000UL     // STM32 timer fires every 1 minute
-#define WAKE_MIN_DISTANCE_M 15.0
-#define HTTP_REQ_DELAY 3000UL  //5000UL  // 5sec
-
-//_____LIS2DS
-
-// LIS2DS12 Register Addresses
-#define LIS2DS12_ADDRESS 0x1D
-
-#define LIS2DS12_REG_CTRL1 0x20
-#define LIS2DS12_REG_CTRL2 0x21
-#define LIS2DS12_REG_CTRL3 0x22
-#define LIS2DS12_REG_CTRL4 0x23
-#define LIS2DS12_REG_CTRL5 0x24
-
-#define LIS2DS12_TAP_6D_THS 0x31
-#define LIS2DS12_REG_INT_DUR 0x32
-#define LIS2DS12_WAKE_UP_THS 0x33
-#define LIS2DS12_FUNC_CTRL 0x3F
-#define LIS2DS12_REG_SM_THS 0x34
-
-#define LIS2DS12_REG_STATUS 0x27
-#define LIS2DS12_REG_OUT_X_L 0x28
-#define LIS2DS12_REG_OUT_X_H 0x29
-#define LIS2DS12_REG_OUT_Y_L 0x2A
-#define LIS2DS12_REG_OUT_Y_H 0x2B
-#define LIS2DS12_REG_OUT_Z_L 0x2C
-#define LIS2DS12_REG_OUT_Z_H 0x2D
-
-//______ Variable
-
-// ─── Network / server config ─ edit before flashing ──────────────────────────
-#define APN "internet"                           // Operator APN
-#define HTTP_SERVER "http://admin.stepwhere.in"  // Host (no http://)
-#define HTTP_PORT 80
-#define HTTPS_PORT 443
-// #define HTTP_PATH "/api/location-store"  // Endpoint
-// #define SERVER_CMD "AT+HTTPPARA=url,\"http://admin.stepwhere.in/api/location-store\""
-// #define SERVER_CMD "AT+HTTPPARA=url,\"http://8545-106-219-71-174.ngrok-free.app/api/location-store\""
-
-#define HTTP_PATH "/location"
-#define SERVER_CMD "AT+HTTPPARA=url,\"http://ingest.stepwhere.in/location\""
-
-#define HTTPS_SERVER_CMD "AT+HTTPSPARA=url,\"https://admin.stepwhere.in/api/location-store\""
-
-#if 0
-#define NEOWWAY_SERVER "AT+HTTPPARA=url,\"121.15.200.97/Service1.asmx/GetNote\""
-#define NEOWAY_DATA "MAC=NEOWAY&DATA=0123456"
-#else
-#define NEOWWAY_SERVER "AT+HTTPPARA=url,\"http://www.example.com\""
-#define NEOWAY_DATA "MAC=NEOWAY&DATA=0123456"
-#endif
-
-//"AT+HTTPPARA=url,\"http://admin.stepwhere.in/api/location-store\"", 1000
-
-// ─── SSL / Certificate config ─────────────────────────────────────────────────
-#define CA_CERT_FILENAME "ca_cert.pem"  // name stored on the module
-#define CERT_UPLOAD_TIMEOUT 10000UL     // ms to wait for CONNECT / +CERTADD: OK
-
-const char ROOT_CA[] = { 0 };
-
-// ─── HTTPS server config — edit before flashing ───────────────────────────────
-// #define HTTPS_SERVER  "admin.stepwhere.in"   // Host (no https://)
-#define HTTPS_SERVER "011d-106-219-68-21.ngrok-free.app"  // Host (no https://)
-#define HTTPS_PORT 443
-#define HTTPS_PATH "/api/location-store"  // Endpoint
-#define HTTPS_SSL_VERSION 3               // 0=SSL3.0 1=TLS1.0 2=TLS1.1 3=TLS1.2
-#define HTTPS_AUTH_MODE 1                 // 0=no auth 1=server auth 2=mutual auth
-
-// ─── Version ────────────────────────────────────────────────────────────────
-#define APP_VERSION "v1.2"
-// ─── TinyGPS++ ────────────────────────────────────────────────────────────────
-TinyGPSPlus gps;
-
-
-//variable
-String g_imei = "";
-volatile uint32_t wake_count = 0;
-uint8_t is_charging = false;
-// ─── Forward declarations ─────────────────────────────────────────────────────
-
-void ldo_enable(bool on);
-void gsm_power_on();
-void gsm_power_off();
-bool gsm_send_at(const char *cmd, const char *expect,
-                 uint32_t timeout_ms, String *response = nullptr);
-bool modem_check();
-String get_imei();
-bool gprs_on();
-bool http_post_json(const char *json_payload);
-bool http_post(const char *json_payload);
-bool https_post_location_json(const char *json_payload);
-String build_location_telemetry_json();
-String json_escape(const String &value);
-bool https_post(const char *json_payload);
-void gps_feed(uint32_t duration_ms);
-void print_gps_info();
-void build_json(char *buf, size_t buf_size, const String &imei);
-bool neoway_test(const char *json_payload);
-// ═════════════════════════════════════════════════════════════════════════════
-//  POWER MANAGEMENT
-// ═════════════════════════════════════════════════════════════════════════════
-
-/** Enable / disable the LDO that powers the GSM & GPS modules */
-void ldo_enable(bool on) {
-  digitalWrite(LDO_EN, on ? HIGH : LOW);
-  DEBUG.print("[LDO] ");
-  DEBUG.println(on ? "ON" : "OFF");
-  if (on) delay(100);  // let the rail stabilise
-}
-
-/**
- * Power ON — Neoway N706.
- * PWRKEY must be held LOW for ≥ 1 s while VBAT is present.
- */
-void gsm_power_on() {
-  DEBUG.println("[GSM] Power ON ...");
-  ldo_enable(true);
-  delay(500);  // LDO settle
-
-  digitalWrite(GSM_PWRKEY, HIGH);
-  delay(100);
-  digitalWrite(GSM_PWRKEY, LOW);
-  delay(1200);  // hold ≥ 1 s
-  digitalWrite(GSM_PWRKEY, HIGH);
-
-  DEBUG.println("[GSM] Waiting for boot ...");
-  delay(3000);
-
-  while (SerialGSM.available()) SerialGSM.read();  // flush boot noise
-  DEBUG.println("[GSM] Power ON complete.");
-}
-
-/**
- * Power OFF — Neoway N706.
- * AT+CFUN=0 turns off radio and SIM power (N706 AT Manual §3.14).
- * Then cut the LDO.
- */
-void gsm_power_off() {
-  DEBUG.println("[GSM] Power OFF ...");
-  gsm_send_at("AT+CFUN=0", "OK", 5000);
-  delay(1000);
-  // ldo_enable(false);
-  DEBUG.println("[GSM] Power OFF complete.");
-}
-
-
-// =============================================================================
-//  SYSTEM STATUS FLAGS
-// =============================================================================
-struct http_status {
-  bool ok = false;
-  uint8_t reconnect_cnt = 0;
-  unsigned long last_send = 0;
-} g_http_status;
-
-
-struct SystemStatus {
-  bool powered_on;      // LDO on + modem responded to AT
-  bool imei_valid;      // IMEI is 15 digits and non-empty
-  bool gprs_connected;  // AT+XIIC=1 succeeded and IP assigned
-  bool is_gps_ready;
-
-  // Returns true only when all three conditions are met
   bool ready() const {
-    return powered_on && imei_valid && gprs_connected;
+    return rail_on && at_ok && functional && sim_ready && imei_valid && data_connected;
   }
+} g_modem;
 
-  void reset() {
-    powered_on = false;
-    gprs_connected = false;
-    is_gps_ready = false;
-  }
+struct GpsState {
+  bool fix = false;
+  bool ever_fixed = false;
+  double lat = 0.0;
+  double lon = 0.0;
+  uint8_t sats = 0;
+  uint32_t last_char_at = 0;
+  bool uart_on = false;
+  bool restart_attempted = false;
+  uint32_t restart_at = 0;
+} g_gps;
 
-  void print() const {
-    INFO.println("[STATUS] ---- System Status ----");
-    INFO.print("[STATUS] Powered ON   : ");
-    INFO.println(powered_on ? "YES" : "NO");
-    INFO.print("[STATUS] IMEI valid   : ");
-    INFO.println(imei_valid ? "YES" : "NO");
-    INFO.print("[STATUS] GPRS connect : ");
-    INFO.println(gprs_connected ? "YES" : "NO");
-    INFO.print("[STATUS] GPS        : ");
-    INFO.println(is_gps_ready ? "YES" : "NO");
-    INFO.print("[STATUS] Ready        : ");
-    INFO.println(ready() ? "YES" : "NO");
-    INFO.println("[STATUS] --------------------");
-  }
-} g_status;
-
-
-// ─── Step / activity tracker ──────────────────────────────────────────────────
 struct StepTracker {
-  volatile uint32_t step_isr_count = 0;  // incremented in INT2 ISR
-  uint32_t steps_this_min = 0;           // steps in last 1-min window
-  uint32_t steps_total = 0;              // lifetime step total
-  uint32_t previous_steps = 0;           // snapshot at last minute boundary
-  uint16_t minute_counter = 0;           // uptime in minutes (wraps at 10000)
-  unsigned long last_active_ms = 0;      // millis() of last step event
-  bool active = false;                   // had steps in last window
-  volatile bool sleep_mode_on = false;   // sleep flag
-  uint8_t sleep_minute_count = 0;        // minutes elapsed since last wake-up
-  double sleep_ref_lat = 0.0;            // GPS position at wake-up
+  uint32_t steps_total = 0;
+  uint32_t steps_this_minute = 0;
+  uint32_t wake_steps = 0;  // steps since the minute boundary, for waking from sleep
+  uint16_t minute_counter = 0;
+  uint32_t minute_started = 0;
+  bool sleep_mode_on = false;
+  uint8_t sleep_minute_count = 0;
+  double sleep_ref_lat = 0.0;
   double sleep_ref_lon = 0.0;
   bool start_safe_shut_down = false;
   bool send_sleep_data = false;
-
-  void mark_active() {
-    last_active_ms = millis();
-    active = true;
-    sleep_mode_on = false;
-  }
-  bool is_inactive() {
-    return (millis() - last_active_ms) >= STEP_INACTIVITY_LIMIT_MS;
-  }
 } g_steps;
 
-// ─── Location / sleep tracker ─────────────────────────────────────────────────
-struct LocationTracker {
-  double last_lat = 0.0;
-  double last_lon = 0.0;
-  double current_lat = 0.0;
-  double current_lon = 0.0;
-  int num_satellite = 0;
-  unsigned long last_check_ms = 0;     // millis() of last 1-min check
-  unsigned long stationary_since = 0;  // millis() when movement stopped
-  bool has_fix = false;                // at least one valid fix stored to store
-  bool is_stationary = false;          // currently below threshold
+// Survives software, watchdog and pin resets (not power loss) so a reset does
+// not zero the cumulative step counter the server diffs against.
+#define STEP_PERSIST_MAGIC 0x53544550UL
+struct PersistedSteps {
+  uint32_t magic;
+  uint32_t total;
+  uint32_t check;
+};
+PersistedSteps g_persisted_steps __attribute__((section(".noinit")));
 
-  void update_reference(double lat, double lon) {
-    last_lat = lat;
-    last_lon = lon;
-    has_fix = true;
-    stationary_since = millis();
-    is_stationary = false;
+// Steps detected in the TIM17 interrupt (accel_steps.cpp), not yet added to
+// g_steps. service_motion() moves them over in thread context.
+volatile uint32_t g_isr_steps = 0;
+bool g_accel_ok = false;
+
+stepwhere::ServingCell g_cell;
+stepwhere::WifiScanResult g_wifi;
+stepwhere::WifiScanResult g_wifi_scan_buffer;
+bool g_wifi_valid = false;
+uint32_t g_wifi_scanned_at = 0;
+bool g_wifi_attempted = false;
+uint32_t g_wifi_last_attempt = 0;
+uint32_t g_wifi_scan_interval = WIFI_SCAN_INTERVAL_MS;
+
+enum WifiScanStatus : uint8_t { WIFI_SCAN_OK, WIFI_SCAN_ERROR, WIFI_SCAN_TIMEOUT };
+enum HttpResult : uint8_t { HTTP_ACCEPTED, HTTP_REJECTED, HTTP_TRANSPORT_FAILED };
+enum LocationSource : uint8_t { LOCATION_GPS, LOCATION_WIFI, LOCATION_GSM, LOCATION_NONE };
+
+struct JsonWriter {
+  char *buffer;
+  size_t size;
+  size_t length;
+  bool overflow;
+
+  void raw(const char *text) {
+    const size_t add = strlen(text);
+    if (overflow || length + add >= size) {
+      overflow = true;
+      return;
+    }
+    memcpy(buffer + length, text, add + 1);
+    length += add;
   }
-} g_loc;
 
-volatile bool g_double_tap = false;  // set in INT1 ISR, cleared in loop()
-// ═════════════════════════════════════════════════════════════════════════════
+  void format(const char *fmt, ...) {
+    if (overflow) return;
+    va_list args;
+    va_start(args, fmt);
+    const int written = vsnprintf(buffer + length, size - length, fmt, args);
+    va_end(args);
+    if (written < 0 || (size_t)written >= size - length) {
+      overflow = true;
+      return;
+    }
+    length += written;
+  }
+
+  void coordinate(double value) {
+    char text[24];
+    dtostrf(value, 0, 8, text);
+    raw(text);
+  }
+
+  void tenths(int16_t value) {
+    const int32_t magnitude = value < 0 ? -(int32_t)value : value;
+    format("%s%ld.%ld", value < 0 ? "-" : "", (long)(magnitude / 10), (long)(magnitude % 10));
+  }
+
+  void string(const char *text) {
+    raw("\"");
+    for (const char *c = text; *c; ++c) {
+      if (*c == '"' || *c == '\\') {
+        const char escaped[3] = { '\\', *c, '\0' };
+        raw(escaped);
+      } else if ((uint8_t)*c >= 0x20) {
+        const char plain[2] = { *c, '\0' };
+        raw(plain);
+      }
+    }
+    raw("\"");
+  }
+};
+
+bool g_upload_attempted = false;
+uint32_t g_last_upload = 0;
+char g_payload[2560];
+
+// =============================================================================
+//  BACKGROUND SERVICE — runs inside every wait so long modem operations never
+//  starve the GPS parser, the accelerometer FIFO or the minute bookkeeping.
+// =============================================================================
+
+void service_motion();
+void service_gps();
+void service_minute();
+bool gsm_send_at(const char *cmd, const char *expect, uint32_t timeout_ms, String *response = nullptr);
+
+void service_background() {
+  static bool running = false;
+  if (running) return;
+  running = true;
+  service_gps();
+  service_motion();
+  service_minute();
+  running = false;
+}
+
+void wait_ms(uint32_t duration_ms) {
+  const uint32_t started = millis();
+  while (millis() - started < duration_ms) {
+    service_background();
+    __WFI();  // SysTick wakes this every millisecond
+  }
+}
+
+// =============================================================================
+//  STEPS
+// =============================================================================
+
+uint32_t persisted_check(uint32_t total) {
+  return total ^ 0xA5A5A5A5UL ^ STEP_PERSIST_MAGIC;
+}
+
+void persist_steps() {
+  g_persisted_steps.magic = STEP_PERSIST_MAGIC;
+  g_persisted_steps.total = g_steps.steps_total;
+  g_persisted_steps.check = persisted_check(g_steps.steps_total);
+}
+
+void restore_steps() {
+  if (g_persisted_steps.magic == STEP_PERSIST_MAGIC
+      && g_persisted_steps.check == persisted_check(g_persisted_steps.total)) {
+    g_steps.steps_total = g_persisted_steps.total;
+    INFO.print("[STEPS] Restored step counter: ");
+    INFO.println(g_steps.steps_total);
+  }
+  persist_steps();
+}
+
+void add_steps(uint32_t count) {
+  g_steps.steps_total += count;
+  g_steps.steps_this_minute += count;
+  g_steps.wake_steps += count;
+  persist_steps();
+  if (g_steps.sleep_mode_on && g_steps.wake_steps >= MIN_STEPS) {
+    g_steps.sleep_mode_on = false;
+    g_steps.send_sleep_data = false;
+    g_steps.sleep_minute_count = 0;
+    g_steps.wake_steps = 0;
+    INFO.println("[SLEEP] Walking detected — waking up.");
+  }
+}
+
+void minute_tick() {
+  const uint32_t steps = g_steps.steps_this_minute;
+  g_steps.steps_this_minute = 0;
+  g_steps.wake_steps = 0;
+  g_steps.minute_counter++;
+  if (g_steps.minute_counter > 10000) g_steps.minute_counter = 0;
+
+  INFO.print("[MIN] #");
+  INFO.print(g_steps.minute_counter);
+  INFO.print(" steps=");
+  INFO.print(steps);
+  INFO.print(" total=");
+  INFO.print(g_steps.steps_total);
+  INFO.print(" gps=");
+  INFO.print(g_gps.fix ? "fix" : "nofix");
+  INFO.print(" modem=");
+  INFO.print(g_modem.ready() ? "ready" : "down");
+  INFO.print(" mode=");
+  INFO.print(g_steps.sleep_mode_on ? "sleep" : "active");
+  INFO.print(" bat=");
+  INFO.println(g_power.bat_volt, 2);
+#if STEPWHERE_LOG_LEVEL >= LVL_INFO
+  accel_steps_print_status(SerialDBG);
+#if STEPS_DEBUG
+  accel_steps_print_debug(SerialDBG);
+#endif
+#endif
+
+  if (g_steps.sleep_mode_on) return;
+  if (g_steps.sleep_minute_count < IDLE_TIME) g_steps.sleep_minute_count++;
+  if (g_steps.sleep_minute_count < IDLE_TIME) return;
+
+  // Sleep when the last minute had no steps and GPS (if available) shows no
+  // movement since the previous evaluation.
+  const bool has_gps = g_gps.fix;
+  double distance = 0.0;
+  if (has_gps) {
+    distance = TinyGPSPlus::distanceBetween(g_steps.sleep_ref_lat, g_steps.sleep_ref_lon,
+                                            g_gps.lat, g_gps.lon);
+  }
+  const bool no_movement = !has_gps || distance < WAKE_MIN_DISTANCE_M;
+  if (no_movement && steps == 0) {
+    INFO.println("[SLEEP] Idle — entering sleep mode.");
+    g_steps.sleep_mode_on = true;
+    g_steps.send_sleep_data = true;
+    g_steps.sleep_minute_count = 0;
+    g_steps.start_safe_shut_down = true;
+    g_steps.sleep_ref_lat = g_gps.lat;
+    g_steps.sleep_ref_lon = g_gps.lon;
+  } else if (has_gps) {
+    g_steps.sleep_ref_lat = g_gps.lat;
+    g_steps.sleep_ref_lon = g_gps.lon;
+  }
+}
+
+void service_minute() {
+  if (millis() - g_steps.minute_started < MINUTE_MS) return;
+  g_steps.minute_started += MINUTE_MS;
+  minute_tick();
+}
+
+// =============================================================================
+//  ACCELEROMETER
+// =============================================================================
+
+// Called from the TIM17 interrupt by accel_steps.cpp. Only counts: add_steps()
+// logs and writes .noinit RAM, so it runs later in service_motion().
+void accel_steps_on_steps(uint32_t steps) {
+  g_isr_steps += steps;
+}
+
+void accel_init() {
+  g_accel_ok = accel_steps_begin(dev_i2c, ACCEL_SA0);
+  if (g_accel_ok) {
+    INFO.println("[ACCEL] LIS2DH12 found at 0x19, step counter running (25 Hz FIFO, TIM17 every 500 ms).");
+  } else {
+    ERR.println("[ACCEL] LIS2DH12 not responding - retrying every 5 s, no steps until it answers.");
+  }
+#if STEPWHERE_LOG_LEVEL >= LVL_ERROR
+  accel_steps_check_irq_priorities(SerialDBG);
+#endif
+}
+
+void service_motion() {
+  noInterrupts();
+  const uint32_t steps = g_isr_steps;
+  g_isr_steps = 0;
+  interrupts();
+  if (steps) add_steps(steps);
+}
+
+// =============================================================================
+//  GPS
+// =============================================================================
+
+// Started only once the SIM is ready: the working wifi-experiment build never
+// ran the GPS UART, and the modem must come up exactly as it did there. The
+// G7A is powered with the rail regardless, so it acquires satellites meanwhile.
+void gps_uart_start() {
+  if (g_gps.uart_on || !g_modem.rail_on) return;
+  SerialGPS.begin(GPS_BAUD);
+  g_gps.uart_on = true;
+  g_gps.last_char_at = millis();
+  INFO.println("[GPS] UART started.");
+}
+
+void service_gps() {
+  bool received = false;
+  while (g_gps.uart_on && SerialGPS.available()) {
+    gps.encode(SerialGPS.read());
+    received = true;
+  }
+  if (received) g_gps.last_char_at = millis();
+
+  const bool fix = gps.location.isValid() && gps.location.age() < GPS_FIX_MAX_AGE_MS
+    && gps.satellites.isValid() && gps.satellites.value() > MIN_SAT;
+  if (fix) {
+    g_gps.lat = gps.location.lat();
+    g_gps.lon = gps.location.lng();
+    g_gps.sats = gps.satellites.value();
+    if (!g_gps.ever_fixed) {
+      g_gps.ever_fixed = true;
+      g_steps.sleep_ref_lat = g_gps.lat;
+      g_steps.sleep_ref_lon = g_gps.lon;
+    }
+  }
+  if (fix != g_gps.fix) {
+    INFO.println(fix ? "[GPS] Fix acquired." : "[GPS] Fix lost — using network location.");
+  }
+  g_gps.fix = fix;
+}
+
+// =============================================================================
+//  POWER / BATTERY
+// =============================================================================
+
+// The modem and GPS UARTs run only while the rail is on. An idle TX line sits
+// high and would back-power the unpowered N706/G7A through their inputs, so the
+// rail never fully discharges and the modem can ignore the next PWRKEY pulse.
+// The GPS UART starts later, from gps_uart_start().
+void ldo_enable(bool on) {
+  if (!on) {
+    SerialGSM.end();
+    SerialGPS.end();
+    g_gps.uart_on = false;
+    pinMode(GSM_TX, INPUT_ANALOG);
+    pinMode(GSM_RX, INPUT_ANALOG);
+    pinMode(GPS_TX, INPUT_ANALOG);
+    pinMode(GPS_RX, INPUT_ANALOG);
+  }
+  digitalWrite(LDO_EN, on ? HIGH : LOW);
+  g_modem.rail_on = on;
+  if (on) {
+    g_modem.rail_on_at = millis();
+    g_gps.last_char_at = millis();
+    wait_ms(100);  // let the rail stabilise
+    SerialGSM.begin(GSM_BAUD);
+  }
+}
+
+float adc_read_battery_volts() {
+  const uint16_t vref_raw = (uint16_t)analogRead(ADC_VREF_CH);
+  if (vref_raw == 0) return 0.0f;
+  const float vdda_mv = (1212.0f * 4095.0f) / (float)vref_raw;
+  const uint16_t raw = (uint16_t)analogRead(ADC_PIN);
+  return (raw / 4095.0f) * vdda_mv / 1000.0f * 2.0f;  // 1:2 divider
+}
+
+ChargeStatus read_charge_status() {
+  // TP4056 outputs are open-drain and active LOW.
+  const bool chrg = digitalRead(CHRG_PIN);
+  const bool stdby = digitalRead(STDBY_PIN);
+  if (chrg == LOW && stdby == HIGH) return CHARGE_CHARGING;
+  if (chrg == HIGH && stdby == LOW) return CHARGE_COMPLETE;
+  if (chrg == HIGH && stdby == HIGH) return CHARGE_IDLE;
+  return CHARGE_ERROR;
+}
+
+const char *charge_status_name(ChargeStatus status) {
+  switch (status) {
+    case CHARGE_CHARGING: return "charging";
+    case CHARGE_COMPLETE: return "charge complete";
+    case CHARGE_IDLE: return "not charging";
+    case CHARGE_ERROR: return "charger status invalid";
+    default: return "unknown";
+  }
+}
+
+void update_power() {
+  const float volts = adc_read_battery_volts();
+  if (volts <= 0.0f) return;  // failed Vref read; keep the previous sample
+  g_power.bat_volt = volts;
+  if (g_power.bat_volt > MIN_BAT_VOLT) {
+    int level = (int)((g_power.bat_volt - MIN_BAT_VOLT) * BAT_RATIO);
+    g_power.battery_level = level > 100 ? 100 : (level < 0 ? 0 : level);
+  } else {
+    g_power.battery_level = 0;
+  }
+
+  const bool was_low = g_power.battery_low;
+  if (g_power.bat_volt < BATTERY_LOW_OFF) g_power.battery_low = true;
+  else if (g_power.bat_volt >= BATTERY_LOW_ON) g_power.battery_low = false;
+  if (g_power.battery_low && !was_low) {
+    WARN.print("[BATTERY] Low — modem and GPS off at ");
+    WARN.print(g_power.bat_volt, 2);
+    WARN.println(" V");
+  } else if (!g_power.battery_low && was_low) {
+    INFO.print("[BATTERY] Recovered at ");
+    INFO.print(g_power.bat_volt, 2);
+    INFO.println(" V");
+  }
+
+  const ChargeStatus charge = read_charge_status();
+  if (charge != g_power.charge) {
+    g_power.charge = charge;
+    INFO.print("[BATTERY] ");
+    INFO.println(charge_status_name(charge));
+  }
+}
+
+// =============================================================================
 //  AT COMMAND HELPER
-// ═════════════════════════════════════════════════════════════════════════════
+// =============================================================================
 
 /**
  * Send an AT command and wait for an expected substring in the response.
- *
- * @param cmd        Command string — \r\n is appended automatically.
- *                   Pass "" to only listen (e.g. after sending raw body bytes).
- * @param expect     Substring that marks success (e.g. "OK", "+XIIC:")
- * @param timeout_ms Milliseconds to wait
- * @param response   Optional: receives the full reply
- * @return true if expect was found within timeout
+ * Pass "" as cmd to only listen (e.g. after sending raw body bytes).
+ * Returns false on ERROR or timeout.
  */
-#if 0
-bool gsm_send_at(const char *cmd, const char *expect,
-                 uint32_t timeout_ms, String *response) {
-
-    // while (SerialGSM.available()) SerialGSM.read();   // flush RX
-
-    if (cmd[0] != '\0') {
-        DEBUG.print("[AT] >> ");
-        DEBUG.println(cmd);
-        SerialGSM.print(cmd);
-        SerialGSM.print("\r\n");
-    }
-
-    String reply  = "";
-    unsigned long t0   = millis();
-    char c;
-    uint8_t linecount = 0;
-    unsigned long  dot  = millis();
-    uint8_t dataReceived = 0;
-    unsigned long  lastDataTime  = millis();
-    while (millis() - t0 < timeout_ms) {
-        while (SerialGSM.available())
-        {
-            c = (char)SerialGSM.read();
-            reply += c;
-            if(c == '\n')  linecount++;
-
-            if(c == '>') {
-                DEBUG.print("[AT] << ");
-                DEBUG.println(reply);
-                if (response) *response = reply;
-                return true;
-            }
-
-            if(linecount >= 2)
-            {
-                dataReceived = 1;
-                lastDataTime = millis();
-            }
-        }
-
-
-        if(millis() - dot > 1000)
-        {
-            dot  = millis();
-            DEBUG.print(".");
-        }
-         // If we've started receiving and it’s been quiet for 200 ms → done
-        if (dataReceived && (millis() - lastDataTime > 2000)) {
-            if (reply.indexOf(expect) != -1) {
-                DEBUG.print("[AT] << ");
-                DEBUG.println(reply);
-                if (response) *response = reply;
-                return true;
-            }
-            if (reply.indexOf("ERROR") != -1) break;
-        }
-    }
-
-    DEBUG.print("[AT] FAIL — got: ");
-    DEBUG.println(reply);
-    if (response) *response = reply;
+bool gsm_send_at(const char *cmd, const char *expect, uint32_t timeout_ms, String *response) {
+  if (!g_modem.rail_on) {  // the UART is stopped with the rail
+    if (response) *response = "";
     return false;
-}
-#else
-
-bool gsm_send_at(const char *cmd,
-                 const char *expect,
-                 uint32_t timeout_ms,
-                 String *response) {
-
+  }
   while (SerialGSM.available()) SerialGSM.read();
   if (cmd && cmd[0] != '\0') {
-    DEBUG.print("[AT][CMD] >> ");
+    DEBUG.print("[AT] >> ");
     DEBUG.println(cmd);
     SerialGSM.print(cmd);
     SerialGSM.print("\r\n");
-    delay(100);
   }
 
   static String reply;
   reply = "";
-  reply.reserve(128);
-  uint8_t data_count = 0;
+  reply.reserve(256);
+  bool ok = false;
+  bool done = false;
+  const uint32_t started = millis();
 
-  unsigned long start = millis();
-  unsigned long lastRx = millis();
-  unsigned long dot = millis();
-  bool ret_code = false;
-
-  while ((millis() - start) < timeout_ms) {
+  while (!done && g_modem.rail_on && millis() - started < timeout_ms) {
     while (SerialGSM.available()) {
-      char c = (char)SerialGSM.read();
-      reply += c;
-      data_count++;
-      lastRx = millis();
-
-      // Prompt for data mode
-      if (c == '>') {
-        // DEBUG.print("[AT] << ");
-        // DEBUG.println(reply);
-        if (response)
-          *response = reply;
-        ret_code = true;
-        break;
-        //return true;
-      }
-
+      reply += (char)SerialGSM.read();
       if (expect && reply.indexOf(expect) != -1) {
-        // DEBUG.print("[AT] << ");
-        // DEBUG.println(reply);
-        if (response)
-          *response = reply;
-        ret_code = true;
+        ok = true;
+        done = true;
         break;
-        // return true;
-      }  // Failure immediately
-      else if (reply.indexOf("ERROR") != -1) {
-        // DEBUG.print("[AT] << ");
-        // DEBUG.println(reply);
-        if (response)
-          *response = reply;
-        ret_code = false;
+      }
+      if (reply.indexOf("ERROR") != -1) {
+        done = true;
         break;
-        // return false;
       }
     }
-    // Response complete after modem becomes quiet
-    if ((data_count > 127) || (reply.length() > 0 && (millis() - lastRx) > 200)) {
-      if (expect && reply.indexOf(expect) != -1) {
-        // DEBUG.print("[AT] << ");
-        // DEBUG.println(reply);
-        if (response)
-          *response = reply;
-        ret_code = true;
-        break;
-        // return true;
-      }
-    }
-    // print dot if no response
-    if (millis() - dot > 1000) {
-      dot = millis();
-      DEBUG.print(".");
-    }
+    if (!done) service_background();
   }
 
-  DEBUG.print("[AT][RSP] << ");
+  DEBUG.print("[AT] << ");
   DEBUG.println(reply);
-  if (response)
-    *response = reply;
-  return ret_code;
+  if (response) *response = reply;
+  return ok;
 }
-#endif
 
-// ═════════════════════════════════════════════════════════════════════════════
-//  MODEM CHECK  (AT + AT+CPIN?)
-// ═════════════════════════════════════════════════════════════════════════════
-
-/**
- * Verify the modem is alive and the SIM is ready.
- * Retries AT up to 5 times to allow for slow boot.
- */
-bool modem_check() {
-  DEBUG.println("[Modem] Checking AT ...");
-
-  bool at_ok = false;
-  for (int i = 0; i < 5; i++) {
-    if (gsm_send_at("AT", "OK", AT_TIMEOUT)) {
-      at_ok = true;
-      break;
+// Value after `prefix` on a complete reply line, or "" when absent.
+String at_response_value(const String &reply, const char *prefix) {
+  int offset = 0;
+  while (offset < (int)reply.length()) {
+    int end = reply.indexOf('\n', offset);
+    if (end < 0) break;
+    String line = reply.substring(offset, end);
+    line.trim();
+    if (line.startsWith(prefix)) {
+      line.remove(0, strlen(prefix));
+      line.trim();
+      return line;
     }
-    DEBUG.print("[Modem] Retry ");
-    DEBUG.println(i + 1);
-    delay(1000);
+    offset = end + 1;
   }
-  if (!at_ok) {
-    DEBUG.println("[Modem] ERROR: No response to AT");
-    return false;
-  }
+  return "";
+}
 
-  gsm_send_at("ATE0", "OK", AT_TIMEOUT);
+// =============================================================================
+//  MODEM POWER AND READINESS
+// =============================================================================
 
-  DEBUG.println("[Modem] Checking SIM (AT+CPIN?) ...");
-  String reply;
-  if (!gsm_send_at("AT+CPIN?", "+CPIN:", AT_TIMEOUT, &reply)) {
-    DEBUG.println("[Modem] ERROR: No CPIN response");
-    return false;
-  } else {
-    // return true;
-    if (reply.indexOf("READY") != -1) {
-      DEBUG.println("[Modem] SIM READY");
-      return true;
-    }
+void mark_data_activity() {
+  g_modem.data_activity_seen = true;
+  g_modem.last_data_activity = millis();
+}
+
+void modem_invalidate() {
+  g_modem.at_ok = false;
+  g_modem.functional = false;
+  g_modem.sim_ready = false;
+  g_modem.data_connected = false;
+}
+
+/** Rail on, then PWRKEY held LOW for ≥ 1 s (N706 power-on sequence). */
+void modem_power_on() {
+  INFO.println("[MODEM] Power on.");
+  ldo_enable(true);
+  wait_ms(500);
+  digitalWrite(GSM_PWRKEY, HIGH);
+  wait_ms(100);
+  digitalWrite(GSM_PWRKEY, LOW);
+  wait_ms(1200);
+  digitalWrite(GSM_PWRKEY, HIGH);
+  wait_ms(3000);
+  while (SerialGSM.available()) SerialGSM.read();  // flush boot noise
+}
+
+/** Removes and restores the shared GSM/GPS rail. */
+void modem_rail_cycle(const char *reason) {
+  WARN.print("[MODEM] Power cycling: ");
+  WARN.println(reason);
+  modem_invalidate();
+  ldo_enable(false);
+  wait_ms(2000);
+  modem_power_on();
+}
+
+/** Radio and SIM off (AT+CFUN=0) for sleep; the rail stays on for GPS. */
+void modem_radio_off() {
+  gsm_send_at("AT+CFUN=0", "OK", 5000);
+  wait_ms(1000);
+  modem_invalidate();
+}
+
+void modem_backoff(uint32_t duration_ms) {
+  g_modem.backoff = true;
+  g_modem.backoff_started = millis();
+  g_modem.backoff_ms = duration_ms;
+}
+
+bool modem_wait_for_at() {
+  const uint32_t started = millis();
+  while (g_modem.rail_on && millis() - started < MODEM_AT_TIMEOUT_MS) {
+    if (gsm_send_at("AT", "OK", AT_TIMEOUT)) return true;
+    wait_ms(1000);
   }
-  // if      (reply.indexOf("SIM PIN") != -1) DEBUG.println("[Modem] ERROR: SIM PIN required");
-  // else if (reply.indexOf("SIM PUK") != -1) DEBUG.println("[Modem] ERROR: SIM PUK required");
-  // else                                      DEBUG.println("[Modem] ERROR: SIM not ready");
   return false;
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-//  IMEI  (AT+CGSN)
-// ═════════════════════════════════════════════════════════════════════════════
-
-/**
- * @return 15-digit IMEI string, or "" on failure.
- */
-String get_imei() {
+bool modem_restore_functionality() {
   String reply;
-  if (!gsm_send_at("AT+CGSN", "OK", AT_TIMEOUT, &reply)) {
-    DEBUG.println("[IMEI] ERROR");
-    return "";
+  if (!gsm_send_at("AT+CFUN?", "OK", AT_TIMEOUT, &reply)) return false;
+  const String mode = at_response_value(reply, "+CFUN:");
+  if (mode == "1") return true;
+  if (mode != "0" && mode != "4") {
+    WARN.print("[MODEM] Unexpected CFUN state: ");
+    WARN.println(mode);
+    return false;
   }
-  // Raw reply: \r\nAT+CGSN\r\n\r\n<15 digits>\r\n\r\nOK\r\n
-  // Strip echo
-  int echo = reply.indexOf("+CGSN: ");
+  if (!gsm_send_at("AT+CFUN=1", "OK", AT_LONG_TIMEOUT)) return false;
+  return gsm_send_at("AT+CFUN?", "OK", AT_TIMEOUT, &reply) && at_response_value(reply, "+CFUN:") == "1";
+}
+
+// `last_reply` keeps the final AT+CPIN? answer so a failure can be reported.
+bool modem_wait_for_sim(String &last_reply) {
+  const uint32_t started = millis();
+  while (g_modem.rail_on && millis() - started < SIM_READY_TIMEOUT_MS) {
+    if (gsm_send_at("AT+CPIN?", "OK", AT_TIMEOUT, &last_reply)
+        && at_response_value(last_reply, "+CPIN:") == "READY") {
+      return true;
+    }
+    wait_ms(2000);
+  }
+  return false;
+}
+
+bool modem_read_imei() {
+  String reply;
+  if (!gsm_send_at("AT+CGSN", "OK", AT_TIMEOUT, &reply)) return false;
+  // Reply: [+CGSN: ]<15 digits> ... OK
+  const int echo = reply.indexOf("+CGSN: ");
   if (echo != -1) reply = reply.substring(echo + 7);
-  // Strip OK
-  int ok = reply.lastIndexOf("OK");
+  const int ok = reply.lastIndexOf("OK");
   if (ok != -1) reply = reply.substring(0, ok);
   reply.trim();
-
-  DEBUG.print("[IMEI] ");
-  DEBUG.println(reply);
-  return reply;
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-//  GPRS ON  (AT+CGDCONT → AT+XIIC=1)
-//  N706 AT Manual §5.2: AT+CGDCONT must be set before AT+XIIC=1
-// ═════════════════════════════════════════════════════════════════════════════
-
-/**
- * Bring up GPRS bearer.
- *
- * Per the manual:
- *   1. AT+CGDCONT=1,"IP","<apn>"   — configure PDP context
- *   2. AT+XIIC=1                   — activate PPP link  → OK
- *   3. AT+XIIC?                    → +XIIC: 1,<ip>      — confirm IP
- */
-bool gprs_on() {
-  INFO.println("[GPRS] Configuring APN (AT+CGDCONT) ...");
-
-  char cmd[80];
-  snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"IP\",\"%s\"", APN);
-  if (!gsm_send_at(cmd, "OK", AT_TIMEOUT)) {
-    ERR.println("[GPRS] ERROR: AT+CGDCONT failed");
-    return false;
+  if (reply.length() != 15) return false;
+  for (uint8_t i = 0; i < 15; ++i) {
+    if (!isdigit((unsigned char)reply.charAt(i))) return false;
   }
-
-  // Close any existing PPP link first (ignore errors)
-  gsm_send_at("AT+XIIC=0", "OK", AT_TIMEOUT);
-  delay(500);
-
-  DEBUG.println("[GPRS] Activating PPP link (AT+XIIC=1) ...");
-  if (!gsm_send_at("AT+XIIC=1", "OK", AT_LONG_TIMEOUT)) {
-    ERR.println("[GPRS] ERROR: AT+XIIC=1 failed");
-    return false;
-  }
-  delay(1000);  // let IP assignment settle
-
-  // Verify connection and read assigned IP
-  String reply;
-  if (!gsm_send_at("AT+XIIC?", "+XIIC:", 5000, &reply)) {
-    ERR.println("[GPRS] ERROR: AT+XIIC? no response");
-    return false;
-  }
-
-  // +XIIC: <state>,<ip>   state: 1 = connected
-  int idx = reply.indexOf("+XIIC:");
-  if (idx == -1) {
-    ERR.println("[GPRS] ERROR: unexpected format");
-    return false;
-  }
-  INFO.println(reply.c_str());
-  // String val = reply.substring(idx + 4);
-  // val.trim();
-  // // Manual shows four spaces before state digit: "+XIIC:    1,10.107.216.162"
-  // val.trim();   // trim again after removing prefix
-
-  // if (val.charAt(0) != '1') {
-  //     DEBUG.println("[GPRS] ERROR: PPP not connected (+XIIC state != 1)");
-  //     return false;
-  // }
-  // int comma = val.indexOf(',');
-  // String ip = (comma != -1) ? val.substring(comma + 1) : "?";
-  // ip.trim();
-  int Index1 = reply.indexOf(',');
-  int Index2 = reply.indexOf('\r', Index1 + 1);
-  String ip = reply.substring(Index1 + 1, Index2);
-  ip.trim();
-  // if ((ip.indexOf("0.0.0.0") == -1) && (ip.indexOf("OK") == -1)) {
-  // //    DEBUG.println("**IP:");
-  // //    DEBUG.println(ip);
-  // return ip;
-  // } else {
-  // return "IP not found error";
-  // }
-
-  INFO.print("[GPRS] IP: ");
-  INFO.println(ip);
-  INFO.println("[GPRS] GPRS UP");
+  reply.toCharArray(g_modem.imei, sizeof(g_modem.imei));
   return true;
 }
 
-
-/**
- * Read a CONNECT-prompt response from SerialGSM and then send raw bytes.
- * Used by cert_upload() — the module behaves like a file-upload prompt:
- *   AT+CERTADD=<file_name>,<length>
- *   CONNECT                       ← module is ready for raw bytes
- *   <send exactly <length> bytes>
- *   +CERTADD: <length>,OK         ← success
- *   or
- *   +CERTADD: ERROR / ERROR       ← failure
- */
-bool cert_upload(const char *filename, const char *pem_progmem, size_t pem_len) {
-  DEBUG.print("[CERT] Uploading ");
-  DEBUG.print(filename);
-  DEBUG.print(" (");
-  DEBUG.print(pem_len);
-  DEBUG.println(" bytes) ...");
-
-  char cmd[64];
-  snprintf(cmd, sizeof(cmd), "AT+CERTADD=%s,%u", filename, (unsigned)pem_len);
-
-  // Send the command and wait for the CONNECT prompt
-  if (!gsm_send_at(cmd, "CONNECT", CERT_UPLOAD_TIMEOUT)) {
-    DEBUG.println("[CERT] ERROR: no CONNECT prompt — upload aborted");
-    return false;
+// "+XIIC: <state>,<ip>" — connected only with state 1 and a nonzero IPv4 address.
+bool parse_xiic_connected(const String &value, char *ip_out, size_t ip_size) {
+  int state = 0;
+  char ip[40] = "";
+  char extra = '\0';
+  if (sscanf(value.c_str(), " %d , %39s %c", &state, ip, &extra) != 2 || state != 1) return false;
+  const char *cursor = ip;
+  bool nonzero = false;
+  for (uint8_t octet = 0; octet < 4; ++octet) {
+    if (!isdigit((unsigned char)*cursor)) return false;
+    char *end = nullptr;
+    const long part = strtol(cursor, &end, 10);
+    if (part < 0 || part > 255) return false;
+    nonzero |= part != 0;
+    if ((octet < 3 && *end != '.') || (octet == 3 && *end != '\0')) return false;
+    cursor = end + (octet < 3 ? 1 : 0);
   }
-
-  // Stream the PEM bytes from PROGMEM directly to the modem UART
-  for (size_t i = 0; i < pem_len; i++) {
-    char c = pem_progmem[i];
-    SerialGSM.write(c);
-  }
-
-  // Wait for the final +CERTADD: <len>,OK confirmation
-  String reply;
-  bool ok = gsm_send_at("", "+CERTADD:", CERT_UPLOAD_TIMEOUT, &reply);
-
-  if (!ok || reply.indexOf("OK") == -1) {
-    DEBUG.print("[CERT] ERROR: upload failed — got: ");
-    DEBUG.println(reply);
-    return false;
-  }
-
-  DEBUG.println("[CERT] Upload OK.");
+  if (!nonzero) return false;
+  snprintf(ip_out, ip_size, "%s", ip);
   return true;
 }
 
-/**
- * Convenience wrapper to upload the CA cert defined above.
- */
-bool cert_upload_ca() {
-  size_t len = strlen(ROOT_CA);
-  cert_delete(CA_CERT_FILENAME);
-  return cert_upload(CA_CERT_FILENAME, ROOT_CA, len);
-}
-
-/**
- * Check whether a certificate file already exists on the module.
- * AT+CERTCHECK=<file_name>  →  +CERTCHECK: <file_name>,OK  (exists)
- *                            or +CERTCHECK: ERROR           (does not exist)
- */
-bool cert_check(const char *filename) {
-  char cmd[64];
-  snprintf(cmd, sizeof(cmd), "AT+CERTCHECK=%s", filename);
-
+bool modem_data_verified(char *ip, size_t ip_size) {
   String reply;
-  gsm_send_at(cmd, "CERTCHECK", AT_TIMEOUT, &reply);
-
-  bool exists = (reply.indexOf("OK") != -1) && (reply.indexOf("ERROR") == -1);
-  DEBUG.print("[CERT] ");
-  DEBUG.print(filename);
-  DEBUG.println(exists ? " — exists" : " — not found");
-  return exists;
+  if (!gsm_send_at("AT+XIIC?", "OK", 5000, &reply)) return false;
+  return parse_xiic_connected(at_response_value(reply, "+XIIC:"), ip, ip_size);
 }
 
-/**
- * Delete a certificate by name, or all certificates if filename is "".
- */
-bool cert_delete(const char *filename) {
-  char cmd[64];
-  if (filename[0] != '\0') {
-    snprintf(cmd, sizeof(cmd), "AT+CERTDEL=%s", filename);
-  } else {
-    snprintf(cmd, sizeof(cmd), "AT+CERTDEL");
-  }
-  return gsm_send_at(cmd, "OK", AT_TIMEOUT);
-}
-
-/**
- * Ensure the CA certificate is present on the module — uploads it only if
- * it is not already there. Call once from setup() before using HTTPS.
- */
-bool cert_ensure_ca_present() {
-  DEBUG.println("[CERT] Checking for CA certificate on module ...");
-  if (cert_check(CA_CERT_FILENAME)) {
-    DEBUG.println("[CERT] CA certificate already present — skipping upload.");
+/** AT+CGDCONT → AT+XIIC=1 → verified IP (N706 AT Manual §5.2). */
+bool modem_data_connect() {
+  char ip[40];
+  const bool force = g_modem.force_data_reactivate;
+  g_modem.force_data_reactivate = false;
+  if (!force && modem_data_verified(ip, sizeof(ip))) {
+    INFO.print("[MODEM] Data connected, IP ");
+    INFO.println(ip);
     return true;
   }
-  DEBUG.println("[CERT] CA certificate not found — uploading now.");
-  return cert_upload_ca();
+  char cmd[64];
+  snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"IP\",\"%s\"", APN);
+  if (!gsm_send_at(cmd, "OK", AT_TIMEOUT)) return false;
+  gsm_send_at("AT+XIIC=0", "OK", AT_TIMEOUT);  // close any stale link
+  wait_ms(500);
+  const bool activated = gsm_send_at("AT+XIIC=1", "OK", AT_LONG_TIMEOUT);
+  mark_data_activity();
+  if (!activated) return false;
+  wait_ms(1000);  // let IP assignment settle
+  if (!modem_data_verified(ip, sizeof(ip))) return false;
+  INFO.print("[MODEM] Data connected, IP ");
+  INFO.println(ip);
+  return true;
 }
 
-/**
- * Configure SSL parameters for HTTPS — points the module at the CA cert
- * uploaded via cert_ensure_ca_present(). Call once after GPRS/cert are up,
- * before the first https_post().
- *
- * Sequence (manual §8.10):
- *   AT+HTTPSCFG="sslversion",<3>     → TLS1.2
- *   AT+HTTPSCFG="authmode",<1>       → server auth only (use 2 for mutual TLS)
- *   AT+HTTPSCFG="cacert",ca_cert.pem → CA cert must already be uploaded
- */
-bool https_configure_ssl() {
-  DEBUG.println("[HTTPS] Configuring SSL parameters ...");
-  char cmd[64];
+/** Brings the modem one step closer to ready; true once uploads can run. */
+bool modem_ensure_ready() {
+  if (g_modem.backoff) {
+    if (millis() - g_modem.backoff_started < g_modem.backoff_ms) return false;
+    g_modem.backoff = false;
+  }
+  if (g_power.battery_low && !g_steps.send_sleep_data) return false;
+  if (!g_modem.rail_on) modem_power_on();
+  if (!g_modem.rail_on) return false;
 
-  snprintf(cmd, sizeof(cmd), "AT+HTTPSCFG=\"sslversion\",%d", HTTPS_SSL_VERSION);
-  if (!gsm_send_at(cmd, "OK", AT_TIMEOUT)) {
-    DEBUG.println("[HTTPS] ERROR: sslversion config failed");
-    return false;
+  if (!g_modem.at_ok) {
+    if (!modem_wait_for_at()) {
+      if (!g_modem.rail_on) return false;  // cut for low battery meanwhile
+      if (g_modem.rail_cycles < MODEM_RAIL_CYCLES) {
+        g_modem.rail_cycles++;
+        modem_rail_cycle("no AT response");
+      } else {
+        ERR.println("[MODEM] Not responding after power cycles — retrying in 60 s.");
+        g_modem.rail_cycles = 0;
+        modem_backoff(MODEM_RECOVERY_BACKOFF_MS);
+      }
+      return false;
+    }
+    g_modem.at_ok = true;
+    g_modem.rail_cycles = 0;
+    gsm_send_at("ATE0", "OK", AT_TIMEOUT);
+    gsm_send_at("AT+CMEE=2", "OK", AT_TIMEOUT);  // verbose +CME ERROR text
   }
 
-  snprintf(cmd, sizeof(cmd), "AT+HTTPSCFG=\"authmode\",%d", HTTPS_AUTH_MODE);
-  if (!gsm_send_at(cmd, "OK", AT_TIMEOUT)) {
-    DEBUG.println("[HTTPS] ERROR: authmode config failed");
-    return false;
-  }
-
-  // Only attach the CA cert if authentication is enabled
-  if (HTTPS_AUTH_MODE != 0) {
-    snprintf(cmd, sizeof(cmd), "AT+HTTPSCFG=\"cacert\",%s", CA_CERT_FILENAME);
-    if (!gsm_send_at(cmd, "OK", AT_TIMEOUT)) {
-      DEBUG.println("[HTTPS] ERROR: cacert config failed");
+  if (!g_modem.functional) {
+    g_modem.functional = modem_restore_functionality();
+    if (!g_modem.functional) {
+      WARN.println("[MODEM] Could not enable radio (CFUN=1).");
+      modem_backoff(DATA_RETRY_DELAY_MS);
       return false;
     }
   }
-  DEBUG.println("[HTTPS] SSL configuration OK.");
-  return true;
-}
 
-/**
- * Perform an HTTPS POST with a JSON body.
- *
- * Sequence (manual §8.11-8.14):
- *   AT+HTTPSPARA=url,"<host><path>"
- *   AT+HTTPSPARA=port,<port>
- *   AT+HTTPSSETUP                       → OK  (requires AT+XIIC=1 already up)
- *   AT+HTTPSACTION=2,<len>,2            → OK then ">" prompt (2=POST, type 2=json)
- *   <send body bytes>
- *                                       → +HTTPSRECV: <raw response>
- *                                       → +HTTPSCLOSED: HTTPS Link Closed
- *   AT+HTTPSCLOSE                       → OK
- *
- * @return true if the server responded (+HTTPSRECV: received)
- */
-bool https_post_v1(const char *json_payload) {
-  DEBUG.println("[HTTPS] Starting HTTPS POST ...");
-
-  size_t payload_len = strlen(json_payload);
-  char cmd[200];
-
-  // ── 1) Set URL ────────────────────────────────────────────────────────────
-  snprintf(cmd, sizeof(cmd),
-           "AT+HTTPSPARA=url,\"%s%s\"", HTTPS_SERVER, HTTPS_PATH);
-  if (!gsm_send_at(cmd, "OK", AT_TIMEOUT)) {
-    DEBUG.println("[HTTPS] ERROR: HTTPSPARA url failed");
-    return false;
-  }
-
-  // ── 2) Set port ───────────────────────────────────────────────────────────
-  snprintf(cmd, sizeof(cmd), "AT+HTTPSPARA=port,%d", HTTPS_PORT);
-  if (!gsm_send_at(cmd, "OK", AT_TIMEOUT)) {
-    DEBUG.println("[HTTPS] ERROR: HTTPSPARA port failed");
-    return false;
-  }
-
-  // ── 3) Open HTTPS connection ──────────────────────────────────────────────
-  if (!gsm_send_at("AT+HTTPSSETUP", "OK", HTTP_TIMEOUT)) {
-    DEBUG.println("[HTTPS] ERROR: HTTPSSETUP failed");
-    gsm_send_at("AT+HTTPSCLOSE", "OK", AT_TIMEOUT);
-    return false;
-  }
-
-  // ── 4) POST — mode=2, length, type=2(json) ────────────────────────────────
-  snprintf(cmd, sizeof(cmd), "AT+HTTPSACTION=2,%u,2", (unsigned)payload_len);
-  if (!gsm_send_at(cmd, ">", AT_TIMEOUT)) {
-    DEBUG.println("[HTTPS] ERROR: HTTPSACTION no > prompt");
-    gsm_send_at("AT+HTTPSCLOSE", "OK", AT_TIMEOUT);
-    return false;
-  }
-
-  // ── 5) Send body ──────────────────────────────────────────────────────────
-  DEBUG.print("[HTTPS] Sending body: ");
-  DEBUG.println(json_payload);
-  SerialGSM.print(json_payload);
-
-  // ── 6) Wait for server response (+HTTPSRECV:) ─────────────────────────────
-  String resp;
-  bool got_recv = gsm_send_at("", "+HTTPSRECV:", HTTP_TIMEOUT, &resp);
-
-  if (!got_recv) {
-    DEBUG.println("[HTTPS] ERROR: no +HTTPSRECV response");
-    gsm_send_at("AT+HTTPSCLOSE", "OK", AT_TIMEOUT);
-    return false;
-  }
-
-  // Collect until +HTTPSCLOSED: URC or timeout
-  uint32_t t0 = millis();
-  while (millis() - t0 < 5000) {
-    while (SerialGSM.available()) resp += (char)SerialGSM.read();
-    if (resp.indexOf("+HTTPSCLOSED:") != -1) break;
-  }
-  DEBUG.print("[HTTPS] Response: ");
-  DEBUG.println(resp);
-
-  // ── 7) Close HTTPS socket (HTTPSPARA settings are kept per §8.14) ────────
-  gsm_send_at("AT+HTTPSCLOSE", "OK", AT_TIMEOUT);
-
-  DEBUG.println("[HTTPS] POST complete.");
-  return true;
-}
-
-bool https_post_location_json(const char *json_payload) {
-  DEBUG.println("[HTTPS] Starting telemetry JSON POST ...");
-
-  size_t payload_len = strlen(json_payload);
-  char cmd[200];
-
-  snprintf(cmd, sizeof(cmd),
-           "AT+HTTPSPARA=url,\"%s%s\"", HTTPS_SERVER, HTTPS_PATH);
-  if (!gsm_send_at(cmd, "OK", AT_TIMEOUT)) {
-    DEBUG.println("[HTTPS] ERROR: telemetry HTTPSPARA url failed");
-    return false;
-  }
-
-  snprintf(cmd, sizeof(cmd), "AT+HTTPSPARA=port,%d", HTTPS_PORT);
-  if (!gsm_send_at(cmd, "OK", AT_TIMEOUT)) {
-    DEBUG.println("[HTTPS] ERROR: telemetry HTTPSPARA port failed");
-    return false;
-  }
-
-  if (!gsm_send_at("AT+HTTPSSETUP", "OK", HTTP_TIMEOUT)) {
-    DEBUG.println("[HTTPS] ERROR: telemetry HTTPSSETUP failed");
-    gsm_send_at("AT+HTTPSCLOSE", "OK", AT_TIMEOUT);
-    return false;
-  }
-
-  snprintf(cmd, sizeof(cmd), "AT+HTTPSACTION=2,%u,2", (unsigned)payload_len);
-  if (!gsm_send_at(cmd, ">", AT_LONG_TIMEOUT)) {
-    DEBUG.println("[HTTPS] ERROR: telemetry HTTPSACTION no > prompt");
-    gsm_send_at("AT+HTTPSCLOSE", "OK", AT_TIMEOUT);
-    return false;
-  }
-
-  DEBUG.print("[HTTPS] Sending telemetry JSON: ");
-  DEBUG.println(json_payload);
-  SerialGSM.print(json_payload);
-
-  String resp;
-  bool got_recv = gsm_send_at("", "+HTTPSRECV:", HTTP_TIMEOUT, &resp);
-
-  if (!got_recv) {
-    DEBUG.println("[HTTPS] ERROR: telemetry no +HTTPSRECV response");
-    gsm_send_at("AT+HTTPSCLOSE", "OK", AT_TIMEOUT);
-    return false;
-  }
-
-  uint32_t t0 = millis();
-  while (millis() - t0 < 5000) {
-    while (SerialGSM.available()) resp += (char)SerialGSM.read();
-    if (resp.indexOf("+HTTPSCLOSED:") != -1) break;
-  }
-
-  DEBUG.print("[HTTPS] Telemetry response: ");
-  DEBUG.println(resp);
-
-  gsm_send_at("AT+HTTPSCLOSE", "OK", AT_TIMEOUT);
-
-  bool accepted = (resp.indexOf("HTTP/1.1 201") != -1) || (resp.indexOf("HTTP/1.0 201") != -1) || (resp.indexOf(" 201 ") != -1);
-
-  if (!accepted) {
-    DEBUG.println("[HTTPS] ERROR: telemetry POST did not return 201");
-  }
-
-  return accepted;
-}
-
-
-
-
-
-// ═════════════════════════════════════════════════════════════════════════════
-//  HTTP POST
-//  N706 AT Manual §8.1–8.4
-//
-//  Sequence (from manual POST example, §8.3):
-//    AT+HTTPPARA=url,"<host>/<path>"
-//    AT+HTTPPARA=port,<port>
-//    AT+HTTPSETUP               → OK  (or +HTTPSETUP: FAIL)
-//    AT+HTTPACTION=2,<len>,2    → OK  then ">" prompt
-//    <send body bytes>
-//    (server replies via +HTTPRECV: URC)
-//    (connection closed via +HTTPCLOSED: HTTP Link Closed URC)
-//    AT+HTTPCLOSE               → OK
-//
-//  POST type codes (§8.3): 0=form-urlencoded, 1=text, 2=json, 3=xml, 4=html
-// ═════════════════════════════════════════════════════════════════════════════
-/**
- * Perform HTTP POST with a JSON body.
- * @return true if the server replied (i.e. +HTTPRECV: received)
- */
-bool http_post_json(const char *json_payload) {
-  DEBUG.println("[HTTP] Starting ingest JSON POST ...");
-
-  size_t payload_len = strlen(json_payload);
-  char cmd[220];
-
-  if (!gsm_send_at(SERVER_CMD, "OK", AT_TIMEOUT)) {
-    DEBUG.println("[HTTP] ERROR: HTTPPARA url failed");
-    return false;
-  }
-
-  snprintf(cmd, sizeof(cmd), "AT+HTTPPARA=port,%d", HTTP_PORT);
-  if (!gsm_send_at(cmd, "OK", AT_TIMEOUT)) {
-    DEBUG.println("[HTTP] ERROR: HTTPPARA port failed");
-    return false;
-  }
-
-  if (!gsm_send_at("AT+HTTPSETUP", "OK", AT_LONG_TIMEOUT)) {
-    DEBUG.println("[HTTP] ERROR: HTTPSETUP failed");
-    gsm_send_at("AT+HTTPCLOSE", "OK", AT_TIMEOUT);
-    return false;
-  }
-
-  snprintf(cmd, sizeof(cmd), "AT+HTTPACTION=2,%u,2", (unsigned)payload_len);
-  if (!gsm_send_at(cmd, ">", AT_LONG_TIMEOUT)) {
-    DEBUG.println("[HTTP] ERROR: HTTPACTION no > prompt");
-    gsm_send_at("AT+HTTPCLOSE", "OK", AT_TIMEOUT);
-    return false;
-  }
-
-  DEBUG.print("[HTTP] Sending ingest JSON: ");
-  DEBUG.println(json_payload);
-  SerialGSM.print(json_payload);
-
-  String resp;
-  bool got_recv = gsm_send_at("", "+HTTPRECV:", HTTP_TIMEOUT, &resp);
-
-  if (!got_recv) {
-    DEBUG.println("[HTTP] ERROR: no +HTTPRECV response");
-    gsm_send_at("AT+HTTPCLOSE", "OK", AT_TIMEOUT);
-    return false;
-  }
-
-  uint32_t t0 = millis();
-  while (millis() - t0 < 5000) {
-    while (SerialGSM.available()) resp += (char)SerialGSM.read();
-    if (resp.indexOf("+HTTPCLOSED:") != -1) break;
-  }
-
-  INFO.print("[HTTP] Ingest response: ");
-  INFO.println(resp);
-
-  gsm_send_at("AT+HTTPCLOSE", "OK", AT_TIMEOUT);
-
-  bool accepted =
-    (resp.indexOf("HTTP/1.1 201") != -1) || (resp.indexOf("HTTP/1.0 201") != -1) || (resp.indexOf(" 201 ") != -1);
-
-  if (!accepted) {
-    DEBUG.println("[HTTP] ERROR: ingest POST did not return 201");
-  }
-
-  return accepted;
-}
-
-/**
- * Perform HTTP POST with a JSON body.
- * @return true if the server replied (i.e. +HTTPRECV: received)
- */
-bool http_post(const char *json_payload) {
-  DEBUG.println("[HTTP] Starting HTTP POST ...");
-
-  size_t payload_len = strlen(json_payload);
-  char cmd[200];
-
-  // ── 1) Set URL (host + path, no scheme prefix per manual examples) ────────
-  //   snprintf(cmd, sizeof(cmd),"AT+HTTPPARA=url,\"%s%s\"", HTTP_SERVER, HTTP_PATH);
-  String CMD = SERVER_CMD;
-  if (!gsm_send_at(CMD.c_str(), "OK", AT_TIMEOUT)) {
-    DEBUG.println("[HTTP] ERROR: HTTPPARA url failed");
-    return false;
-  }
-
-  // // ── 2) Set port ───────────────────────────────────────────────────────────
-  // snprintf(cmd, sizeof(cmd), "AT+HTTPPARA=port,%d", HTTP_PORT);
-  // if (!gsm_send_at(cmd, "OK", AT_TIMEOUT)) {
-  //     DEBUG.println("[HTTP] ERROR: HTTPPARA port failed");
-  //     return false;
-  // }
-
-  // ── 3) Open HTTP connection ───────────────────────────────────────────────
-  // Success → OK ; Failure → +HTTPSETUP: FAIL  (§8.2)
-  if (!gsm_send_at("AT+HTTPSETUP", "OK", AT_LONG_TIMEOUT)) {
-    DEBUG.println("[HTTP] ERROR: HTTPSETUP failed");
-    gsm_send_at("AT+HTTPCLOSE", "OK", AT_TIMEOUT);
-
-    return false;
-  }
-  // ── 4) POST — mode=2, length, type=2(json) ────────────────────────────────
-  // After OK the modem outputs ">" and waits for body bytes (§8.3 example)
-
-  snprintf(cmd, sizeof(cmd), "AT+HTTPACTION=2,%d", (unsigned)payload_len + 2);
-  if (!gsm_send_at(cmd, ">", AT_LONG_TIMEOUT)) {
-    DEBUG.println("[HTTP] ERROR: HTTPACTION no > prompt");
-    gsm_send_at("AT+HTTPCLOSE", "OK", AT_TIMEOUT);
-    return false;
-  }
-
-  // ── 5) Send body ──────────────────────────────────────────────────────────
-  DEBUG.print("[HTTP] Sending body: ");
-  DEBUG.println(json_payload);
-
-  // ── 6) Wait for server response (+HTTPRECV:) and connection close ─────────
-  // The module emits +HTTPRECV: <headers+body> then +HTTPCLOSED: HTTP Link Closed
-  String resp;
-  gsm_send_at(json_payload, "OK", HTTP_TIMEOUT, &resp);
-  if (resp.indexOf("OK") == -1) {
-
-    DEBUG.println("[HTTP] ERROR: no +Ok response");
-    gsm_send_at("AT+HTTPCLOSE", "OK", AT_TIMEOUT);
-    return false;
-  }
-
-  // Collect until +HTTPCLOSED URC or timeout
-  resp = "";
-  uint32_t t0 = millis();
-  while (millis() - t0 < 5000) {
-    while (SerialGSM.available()) resp += (char)SerialGSM.read();
-    if (resp.indexOf("+HTTPCLOSED:") != -1) break;
-  }
-  DEBUG.print("[HTTP] Response: ");
-  DEBUG.println(resp);
-
-  // ── 7) Close HTTP socket (clears HTTPPARA settings per §8.4) ─────────────
-  gsm_send_at("AT+HTTPCLOSE", "OK", AT_TIMEOUT);
-  DEBUG.println("[HTTP] POST complete.");
-  return true;
-}
-
-
-/**
- * Perform HTTP POST with a JSON body.
- * @return true if the server replied (i.e. +HTTPRECV: received)
- */
-bool https_post(const char *json_payload) {
-  DEBUG.println("[HTTP] Starting HTTP POST ...");
-
-  size_t payload_len = strlen(json_payload);
-  char cmd[200];
-
-  // AT+HTTPSCFG=”sslversion”,0
-  //   OK
-  // Set the SSL version to SSL3.0.
-
-
-  if (!gsm_send_at("AT+HTTPSCFG?", "OK", AT_TIMEOUT)) {
-    DEBUG.println("[HTTP] ERROR: HTTPSCFG?  failed");
-    return false;
-  }
-  if (!gsm_send_at("AT+HTTPSCFG=\"sslversion\",3", "OK", AT_TIMEOUT)) {
-    DEBUG.println("[HTTP] ERROR: sslversion  failed");
-    return false;
-  }
-
-  // AT + HTTPSCFG ="authmode", 0
-
-  if (!gsm_send_at("AT+HTTPSCFG=\"authmode\",0", "OK", AT_TIMEOUT)) {
-    DEBUG.println("[HTTP] ERROR: HTTPSCFG  failed");
-    return false;
-  }
-
-  // ── 1) Set URL (host + path, no scheme prefix per manual examples) ────────
-  //   snprintf(cmd, sizeof(cmd),"AT+HTTPSPARA=url,\"%s%s\"", HTTP_SERVER, HTTP_PATH);
-  String CMD = "AT+HTTPSPARA=url,\"https://admin.stepwhere.in/api/location-store\"";
-  if (!gsm_send_at(CMD.c_str(), "OK", AT_TIMEOUT)) {
-    DEBUG.println("[HTTP] ERROR: HTTPPSARA url failed");
-    return false;
-  }
-
-  // ── 2) Set port ───────────────────────────────────────────────────────────
-  snprintf(cmd, sizeof(cmd), "AT+HTTPSPARA=port,%d", HTTPS_PORT);
-  if (!gsm_send_at(cmd, "OK", AT_TIMEOUT)) {
-    DEBUG.println("[HTTP] ERROR: HTTPPARA port failed");
-    return false;
-  }
-
-  // ── 3) Open HTTP connection ───────────────────────────────────────────────
-  // Success → OK ; Failure → +HTTPSETUP: FAIL  (§8.2)
-  if (!gsm_send_at("AT+HTTPSSETUP", "OK", AT_LONG_TIMEOUT)) {
-    DEBUG.println("[HTTP] ERROR: HTTPSETUP failed");
-    gsm_send_at("AT+HTTPSCLOSE", "OK", AT_TIMEOUT);
-
-    return false;
-  }
-  // ── 4) POST — mode=2, length, type=2(json) ────────────────────────────────
-  // After OK the modem outputs ">" and waits for body bytes (§8.3 example)
-
-  snprintf(cmd, sizeof(cmd), "AT+HTTPSACTION=2,%d,0", (unsigned)payload_len + 2);
-  if (!gsm_send_at(cmd, ">", AT_LONG_TIMEOUT)) {
-    DEBUG.println("[HTTP] ERROR: HTTPACTION no > prompt");
-    gsm_send_at("AT+HTTPSCLOSE", "OK", AT_TIMEOUT);
-    return false;
-  }
-
-  // ── 5) Send body ──────────────────────────────────────────────────────────
-  DEBUG.print("[HTTP] Sending body: ");
-  DEBUG.println(json_payload);
-
-  // ── 6) Wait for server response (+HTTPRECV:) and connection close ─────────
-  // The module emits +HTTPRECV: <headers+body> then +HTTPCLOSED: HTTP Link Closed
-  String resp;
-  gsm_send_at(json_payload, "OK", HTTP_TIMEOUT, &resp);
-  if (resp.indexOf("OK") == -1) {
-
-    DEBUG.println("[HTTP] ERROR: no +Ok response");
-    gsm_send_at("AT+HTTPSCLOSE", "OK", AT_TIMEOUT);
-    return false;
-  }
-
-  // Collect until +HTTPCLOSED URC or timeout
-  resp = "";
-  uint32_t t0 = millis();
-  while (millis() - t0 < 5000) {
-    while (SerialGSM.available()) resp += (char)SerialGSM.read();
-    if (resp.indexOf("+HTTPSCLOSED:") != -1) break;
-  }
-  DEBUG.print("[HTTP] Response: ");
-  DEBUG.println(resp);
-
-  // ── 7) Close HTTP socket (clears HTTPPARA settings per §8.4) ─────────────
-  gsm_send_at("AT+HTTPSCLOSE", "OK", AT_TIMEOUT);
-  DEBUG.println("[HTTP] POST complete.");
-  return true;
-}
-
-void print_res() {
-  String resp = "";
-  uint32_t t0 = millis();
-  while (millis() - t0 < 5000) {
-    while (SerialGSM.available()) resp += (char)SerialGSM.read();
-    if (resp.indexOf("+HTTPCLOSED:") != -1) break;
-  }
-  DEBUG.print("[HTTP] Response: ");
-  DEBUG.println(resp);
-}
-
-bool neoway_test(const char *json_payload) {
-
-
-#if 1
-  DEBUG.println("[HTTP] Starting HTTP POST ...");
-
-  size_t payload_len = strlen(json_payload);
-  char cmd[200];
-
-  // ── 1) Set URL (host + path, no scheme prefix per manual examples) ────────
-  //   snprintf(cmd, sizeof(cmd),"AT+HTTPPARA=url,\"%s%s\"", HTTP_SERVER, HTTP_PATH);
-  String CMD = NEOWWAY_SERVER;
-  if (!gsm_send_at(CMD.c_str(), "OK", AT_TIMEOUT)) {
-    DEBUG.println("[HTTP] ERROR: HTTPPARA url failed");
-    return false;
-  }
-
-  // // ── 2) Set port ───────────────────────────────────────────────────────────
-  snprintf(cmd, sizeof(cmd), "AT+HTTPPARA=port,%d", 80);
-  if (!gsm_send_at(cmd, "OK", AT_TIMEOUT)) {
-    DEBUG.println("[HTTP] ERROR: HTTPPARA port failed");
-    return false;
-  }
-
-  // ── 3) Open HTTP connection ───────────────────────────────────────────────
-  // Success → OK ; Failure → +HTTPSETUP: FAIL  (§8.2)
-  if (!gsm_send_at("AT+HTTPSETUP", "OK", AT_LONG_TIMEOUT)) {
-    DEBUG.println("[HTTP] ERROR: HTTPSETUP failed");
-    gsm_send_at("AT+HTTPCLOSE", "OK", AT_TIMEOUT);
-    return false;
-  }
-
-  // ── 4) POST — mode=2, length, type=2(json) ────────────────────────────────
-  // After OK the modem outputs ">" and waits for body bytes (§8.3 example)
-
-  // snprintf(cmd, sizeof(cmd), "AT+HTTPACTION=2,%d", (unsigned)payload_len+2);
-  snprintf(cmd, sizeof(cmd), "AT+HTTPACTION=0");
-  if (!gsm_send_at(cmd, ">", AT_LONG_TIMEOUT)) {
-    DEBUG.println("[HTTP] ERROR: HTTPACTION no > prompt");
-    gsm_send_at("AT+HTTPCLOSE", "OK", AT_TIMEOUT);
-    return false;
-  }
-  /*
-  // ── 5) Send body ──────────────────────────────────────────────────────────
-  DEBUG.print("[HTTP] Sending body: ");
-  DEBUG.println(json_payload);
-
-  // ── 6) Wait for server response (+HTTPRECV:) and connection close ─────────
-  // The module emits +HTTPRECV: <headers+body> then +HTTPCLOSED: HTTP Link Closed
-  String resp;
-  gsm_send_at(json_payload, "OK", HTTP_TIMEOUT, &resp);
-  if (resp.indexOf("OK") == -1) {
-
-    DEBUG.println("[HTTP] ERROR: no +Ok response");
-    gsm_send_at("AT+HTTPCLOSE", "OK", AT_TIMEOUT);
-    return false;
-  }
-*/
-  // Collect until +HTTPCLOSED URC or timeout
-
-
-
-
-  String resp = "";
-  uint32_t t0 = millis();
-  while (millis() - t0 < 5000) {
-    while (SerialGSM.available()) resp += (char)SerialGSM.read();
-    if (resp.indexOf("+HTTPCLOSED:") != -1) break;
-  }
-  DEBUG.print("[HTTP] Response: ");
-  DEBUG.println(resp);
-
-  // ── 7) Close HTTP socket (clears HTTPPARA settings per §8.4) ─────────────
-  gsm_send_at("AT+HTTPCLOSE", "OK", AT_TIMEOUT);
-  DEBUG.println("[HTTP] POST complete.");
-  return true;
-#else
-
-  SerialGSM.println("AT+HTTPPARA=url,\"121.15.200.97/Service1.asmx/GetNote\"");
-  print_res();
-  SerialGSM.println("AT+HTTPPARA=port,8080");
-  print_res();
-
-  SerialGSM.println("AT+HTTPSETUP");
-  print_res();
-
-  SerialGSM.println("AT+HTTPACTION=2,25");
-  print_res();
-  SerialGSM.println("MAC=NEOWAY&DATA=0123456");
-  print_res();
-#endif
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-//  GPS HELPERS
-// ═════════════════════════════════════════════════════════════════════════════
-
-void gps_check_timeout() {
-  bool validFix =
-    gps.location.isValid() && gps.satellites.isValid() && (gps.satellites.value() > MIN_SAT);
-
-
-  if (validFix) {
-    gpsNoFixTimerRunning = false;
-    g_status.is_gps_ready = 1;
-    return;
-  }
-
-  if (!gpsNoFixTimerRunning) {
-    gpsNoFixStart = millis();
-    gpsNoFixTimerRunning = true;
-
-    DEBUG.println(
-      "[GPS] No valid fix - timer started");
-
-    return;
-  }
-
-
-  if (millis() - gpsNoFixStart >= GPS_NO_FIX_TIMEOUT_MS) {
-    DEBUG.println(
-      "[GPS] No valid fix for 10 minutes System restart");
-    ldo_enable(false);
-    gpsNoFixTimerRunning = false;
-    gpsNoFixStart = millis();
-    delay(2000);
-    gpsreset_magic = GPS_RESET_MAGIC;
-    NVIC_SystemReset();
-    while (1)
-      ;
-  }
-}
-
-/** Feed NMEA bytes into TinyGPSPlus for duration_ms milliseconds */
-void gps_feed(uint32_t duration_ms) {
-  uint32_t t0 = millis();
-  while (millis() - t0 < duration_ms) {
-    while (SerialGPS.available()) gps.encode(SerialGPS.read());
-    delay(10);
-  }
-
-  g_status.is_gps_ready = 0;
-  // g_loc.current_lat = 0.0f;
-  // g_loc.current_lon = 0.0f;
-  // g_loc.num_satellite = 0;
-   
-  if (!gps.location.isValid()) {
-    DEBUG.println("[GPS] No valid GPS fix — skipping location check.");
-    return;
-  }
-
-  if (!gps.location.isUpdated())
-    return;
-
-  if (!gps.satellites.isValid())
-    return;
-
-  g_loc.num_satellite = gps.satellites.value();
-  g_loc.current_lat = gps.location.lat();
-  g_loc.current_lon = gps.location.lng();
-  if (g_loc.num_satellite > MIN_SAT) {
-    if (!g_loc.has_fix) {
-      g_steps.sleep_ref_lat = g_loc.current_lat;  // update the sleep lat & lon at first
-      g_steps.sleep_ref_lon = g_loc.current_lon;
-      g_loc.update_reference(g_loc.current_lat, g_loc.current_lon);
-      g_loc.has_fix = true;
+  if (!g_modem.sim_ready) {
+    String reply;
+    g_modem.sim_ready = modem_wait_for_sim(reply);
+    if (!g_modem.sim_ready) {
+      reply.replace("\r\n", " ");
+      reply.trim();
+      WARN.print("[MODEM] SIM not ready (");
+      WARN.print(reply.length() ? reply : String("no reply"));
+      WARN.println(") — retrying in 30 s.");
+      modem_backoff(SIM_RETRY_DELAY_MS);
+      return false;
     }
-    g_status.is_gps_ready = 1;
-  } else {
-    g_status.is_gps_ready = 0;
+    INFO.println("[MODEM] SIM ready.");
+    gps_uart_start();
   }
-  DEBUG.print("[GPS] Lat: ");
-  DEBUG.print(g_loc.current_lat, 6);
-  DEBUG.print("  Lon: ");
-  DEBUG.println(g_loc.current_lon, 6);
-  DEBUG.print("[GPS] Sats: ");
-  DEBUG.println(g_loc.num_satellite);
-  /*
-  if (gps.speed.isValid()) {
-    DEBUG.print("[GPS] Speed km/h: ");
-    DEBUG.println(gps.speed.kmph(), 1);
+
+  if (!g_modem.imei_valid) {
+    g_modem.imei_valid = modem_read_imei();
+    if (!g_modem.imei_valid) {
+      WARN.println("[MODEM] IMEI read failed.");
+      modem_backoff(3000);
+      return false;
+    }
+    INFO.print("[MODEM] IMEI ");
+    INFO.println(g_modem.imei);
   }
-  if (gps.altitude.isValid()) {
-    DEBUG.print("[GPS] Alt m: ");
-    DEBUG.println(gps.altitude.meters(), 1);
+
+  if (!g_modem.data_connected) {
+    g_modem.data_connected = modem_data_connect();
+    if (!g_modem.data_connected) {
+      WARN.println("[MODEM] Data activation failed.");
+      if (++g_modem.data_failures >= DATA_FAILURES_BEFORE_RAIL_CYCLE) {
+        g_modem.data_failures = 0;
+        modem_rail_cycle("data activation keeps failing");
+      } else {
+        modem_backoff(DATA_RETRY_DELAY_MS);
+      }
+      return false;
+    }
+    g_modem.data_failures = 0;
+    g_modem.transport_failures = 0;
   }
-  if (gps.date.isValid() && gps.time.isValid()) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "[GPS] UTC %04d-%02d-%02d %02d:%02d:%02d",
-             gps.date.year(), gps.date.month(), gps.date.day(),
-             gps.time.hour(), gps.time.minute(), gps.time.second());
-    DEBUG.println(buf);
-  }
-  */
+  return true;
 }
 
-/** Print current fix to debug console */
-void print_gps_info() {
-  if (g_status.is_gps_ready) {
-    INFO.print("[GPS] Lat: ");
-    INFO.print(g_loc.current_lat, 6);
-    INFO.print("  Lon: ");
-    INFO.println(g_loc.current_lon, 6);
-    INFO.print("[GPS] Sats: ");
-    INFO.println(g_loc.num_satellite);
-  } else {
-    INFO.println("[GPS] Location: INVALID");
+/** After repeated transport failures, re-verify instead of blindly reconnecting. */
+void modem_check_transport() {
+  if (++g_modem.transport_failures < HTTP_TRANSPORT_FAILURES_BEFORE_CHECK) return;
+  g_modem.transport_failures = 0;
+  if (!gsm_send_at("AT", "OK", AT_TIMEOUT)) {
+    WARN.println("[MODEM] Unresponsive after upload failures.");
+    modem_invalidate();
     return;
   }
-  if (gps.date.isValid() && gps.time.isValid()) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "[GPS] UTC %04d-%02d-%02d %02d:%02d:%02d",
-             gps.date.year(), gps.date.month(), gps.date.day(),
-             gps.time.hour(), gps.time.minute(), gps.time.second());
-    INFO.println(buf);
+  char ip[40];
+  if (!modem_data_verified(ip, sizeof(ip))) {
+    WARN.println("[MODEM] Data link lost — reconnecting.");
+    g_modem.data_connected = false;
+    return;
   }
-  /*
-  if (gps.speed.isValid()) {
-    INFO.print("[GPS] Speed km/h: ");
-    INFO.println(gps.speed.kmph(), 1);
+  // The modem reports a connected IP yet uploads keep failing.
+  if (++g_modem.stuck_link_checks >= 2) {
+    g_modem.stuck_link_checks = 0;
+    modem_rail_cycle("uploads keep failing on a connected link");
+  } else {
+    WARN.println("[MODEM] Uploads failing on a connected link — re-activating data.");
+    g_modem.force_data_reactivate = true;
+    g_modem.data_connected = false;
   }
-  if (gps.altitude.isValid()) {
-    INFO.print("[GPS] Alt m: ");
-    INFO.println(gps.altitude.meters(), 1);
-  }
-  if (gps.date.isValid() && gps.time.isValid()) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "[GPS] UTC %04d-%02d-%02d %02d:%02d:%02d",
-             gps.date.year(), gps.date.month(), gps.date.day(),
-             gps.time.hour(), gps.time.minute(), gps.time.second());
-    INFO.println(buf);
-  }
-  INFO.print("[GPS] Sats: ");
-  INFO.println(gps.satellites.isValid() ? (int)gps.satellites.value() : -1);
-  */
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-//  JSON BUILDER
-// ═════════════════════════════════════════════════════════════════════════════
+// =============================================================================
+//  NETWORK LOCATION OBSERVATIONS
+// =============================================================================
 
-void build_json(char *buf, size_t buf_size, const String &imei) {
-  double lat = g_loc.current_lat;  //gps.location.isValid() ? gps.location.lat() : 0.0;
-  double lon = g_loc.current_lon;  //gps.location.isValid() ? gps.location.lng() : 0.0;
-  // double spd = gps.speed.isValid() ? gps.speed.kmph() : 0.0;
-  // double alt = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
-  int sat = g_loc.num_satellite;  //gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
-
-  snprintf(buf, buf_size,
-           "{\"imei\":\"%s\","
-           "\"lat\":%.6f,\"lon\":%.6f,"
-           /* "\"speed\":%.1f,\"alt\":%.1f,"*/
-           "\"sat\":%d,\"valid\":%s}",
-           imei.c_str(), lat, lon, /*spd, alt,*/ sat,
-           gps.location.isValid() ? "true" : "false");
+void query_serving_cell() {
+  String response;
+  const char *error = nullptr;
+  if (!gsm_send_at("AT+NETDMSG", "OK", AT_TIMEOUT, &response)) {
+    g_cell.valid = false;
+    WARN.println("[CELL] AT+NETDMSG failed.");
+    return;
+  }
+  if (!stepwhere::parse_netdmsg(response.c_str(), g_cell, error)) {
+    WARN.print("[CELL] Serving cell rejected: ");
+    WARN.println(error);
+    return;
+  }
+  INFO.print("[CELL] mcc=");
+  INFO.print(g_cell.mobile_country_code);
+  INFO.print(" mnc=");
+  INFO.print(g_cell.mobile_network_code);
+  INFO.print(" tac=");
+  INFO.print(g_cell.tracking_area_code);
+  INFO.print(" cellId=");
+  INFO.println(g_cell.cell_id);
 }
 
-String json_escape(const String &value) {
-  String escaped;
-  escaped.reserve(value.length() + 8);
-  for (size_t i = 0; i < value.length(); i++) {
-    char c = value.charAt(i);
-    switch (c) {
-      case '"': escaped += "\\\""; break;
-      case '\\': escaped += "\\\\"; break;
-      case '\b': escaped += "\\b"; break;
-      case '\f': escaped += "\\f"; break;
-      case '\n': escaped += "\\n"; break;
-      case '\r': escaped += "\\r"; break;
-      case '\t': escaped += "\\t"; break;
-      default:
-        if ((uint8_t)c < 0x20) {
-          char buf[7];
-          snprintf(buf, sizeof(buf), "\\u%04x", c);
-          escaped += buf;
-        } else {
-          escaped += c;
+WifiScanStatus wifi_scan(stepwhere::WifiScanResult &result) {
+  result.clear();
+  if (!g_modem.rail_on) return WIFI_SCAN_ERROR;
+  while (SerialGSM.available()) SerialGSM.read();
+  DEBUG.println("[AT] >> AT+WIFIAPSCAN");
+  SerialGSM.print("AT+WIFIAPSCAN\r\n");
+
+  const uint32_t started = millis();
+  char line[192];
+  uint16_t length = 0;
+  bool overflow = false;
+  while (millis() - started < WIFI_SCAN_TIMEOUT_MS) {
+    if (!g_modem.rail_on) {
+      result.clear();
+      return WIFI_SCAN_ERROR;
+    }
+    while (SerialGSM.available()) {
+      const char c = (char)SerialGSM.read();
+      if (c == '\r') continue;
+      if (c != '\n') {
+        if (length < sizeof(line) - 1) line[length++] = c;
+        else overflow = true;
+        continue;
+      }
+      line[length] = '\0';
+      if (!overflow) {
+        DEBUG.print("[AT] << ");
+        DEBUG.println(line);
+        if (strcmp(line, "OK") == 0) return WIFI_SCAN_OK;
+        if (strcmp(line, "ERROR") == 0 || strncmp(line, "+CME ERROR:", 11) == 0) {
+          result.clear();
+          return WIFI_SCAN_ERROR;
         }
-        break;
+        if (strncmp(line, "+WIFIAPSCAN:", 12) == 0 && !stepwhere::parse_wifi_ap_line(line, result, millis())) {
+          DEBUG.println("[WIFI] Ignored malformed access point line.");
+        }
+      }
+      length = 0;
+      overflow = false;
     }
+    service_background();
   }
-  return escaped;
+  result.clear();
+  return WIFI_SCAN_TIMEOUT;
 }
 
-String build_location_telemetry_json() {
-  String hardware_id = g_imei;
-  hardware_id.trim();
-  if (hardware_id.length() == 0) hardware_id = "<NO_DATA>";
+/**
+ * Refreshes g_wifi at most once per WIFI_SCAN_INTERVAL_MS, after the radio has
+ * been quiet. Returns false when a scan timeout forced a modem power cycle.
+ */
+bool refresh_wifi_observation() {
+  if (g_wifi_attempted && millis() - g_wifi_last_attempt < g_wifi_scan_interval) return true;
+  g_wifi_attempted = true;
 
-  double lat = g_loc.current_lat; //g_loc.has_fix ? g_loc.current_lat : 0.0;
-  double lon = g_loc.current_lon; // g_loc.has_fix ? g_loc.current_lon : 0.0;
+  WifiScanStatus status = WIFI_SCAN_ERROR;
+  for (uint8_t attempt = 1; attempt <= 2; ++attempt) {
+    const uint32_t quiet_ms = attempt == 1 ? WIFI_SCAN_QUIET_MS : WIFI_SCAN_RETRY_DELAY_MS;
+    if (g_modem.data_activity_seen) {
+      const uint32_t since = millis() - g_modem.last_data_activity;
+      if (since < quiet_ms) wait_ms(quiet_ms - since);
+    }
+    const uint32_t started = millis();
+    status = wifi_scan(g_wifi_scan_buffer);
+    if (status == WIFI_SCAN_TIMEOUT) {
+      g_wifi_last_attempt = millis();
+      g_wifi_scan_interval = WIFI_SCAN_TIMEOUT_BACKOFF_MS;
+      modem_rail_cycle("Wi-Fi scan timed out; next scan in 10 minutes");
+      return false;
+    }
+    if (status == WIFI_SCAN_OK) {
+      INFO.print("[WIFI] Scan found ");
+      INFO.print(g_wifi_scan_buffer.count);
+      INFO.print(" access points in ");
+      INFO.print(millis() - started);
+      INFO.println(" ms.");
+      break;
+    }
+    WARN.print("[WIFI] Scan returned ERROR (attempt ");
+    WARN.print(attempt);
+    WARN.println("/2).");
+    // A retry is measured from this failure, not from the last upload.
+    mark_data_activity();
+  }
+  g_wifi_last_attempt = millis();
 
-  String dev_status = g_steps.sleep_mode_on ? "sleep" : "active";
+  if (status == WIFI_SCAN_OK) {
+    g_wifi_scan_interval = WIFI_SCAN_INTERVAL_MS;
+    g_wifi = g_wifi_scan_buffer;
+    g_wifi_valid = g_wifi.count > 0;
+    g_wifi_scanned_at = millis();
+  }
+  // After an ERROR the previous scan stays usable until it is too old.
+  return true;
+}
 
-  int battery_percent = g_vdd_mon.battery_level;
-  if (battery_percent < 0) battery_percent = 0;
-  if (battery_percent > 100) battery_percent = 100;
+// Access points the server's geolocation (Google) accepts: globally
+// administered unicast BSSIDs, not VRRP, with RSSI at or below -10 dBm.
+uint8_t wifi_usable_ap_count() {
+  uint8_t usable = 0;
+  for (uint8_t i = 0; i < g_wifi.count; ++i) {
+    const stepwhere::WifiAccessPoint &point = g_wifi.points[i];
+    const uint8_t first_octet = (uint8_t)strtoul(point.mac, nullptr, 16);
+    if ((first_octet & 0x03) != 0) continue;
+    if (strncmp(point.mac, "00:00:5E:", 9) == 0 || strcmp(point.mac, "00:00:00:00:00:00") == 0) continue;
+    if (point.rssi > -10) continue;
+    ++usable;
+  }
+  return usable;
+}
+
+bool wifi_observation_usable() {
+  return g_wifi_valid && millis() - g_wifi_scanned_at <= WIFI_RESULT_MAX_AGE_MS
+    && wifi_usable_ap_count() >= WIFI_MIN_USABLE_APS;
+}
+
+const char *location_source_name(LocationSource source) {
+  switch (source) {
+    case LOCATION_GPS: return "gps";
+    case LOCATION_WIFI: return "wifi";
+    case LOCATION_GSM: return "gsm";
+    default: return "none";
+  }
+}
+
+// =============================================================================
+//  TELEMETRY PAYLOAD
+// =============================================================================
+
+void append_cellular(JsonWriter &json) {
+  const stepwhere::ServingCell &cell = g_cell;
+  json.format("\"cellular\":{\"radioType\":\"lte\",\"duplexMode\":\"%s\",\"towers\":[{\"role\":\"serving\"",
+              cell.duplex_mode);
+  json.format(",\"mobileCountryCode\":%u,\"mobileNetworkCode\":%u,\"trackingAreaCode\":%u,\"cellId\":%lu",
+              cell.mobile_country_code, cell.mobile_network_code, cell.tracking_area_code,
+              (unsigned long)cell.cell_id);
+  if (cell.has_physical_cell_id) json.format(",\"physicalCellId\":%u", cell.physical_cell_id);
+  if (cell.has_band) {
+    json.raw(",\"band\":");
+    json.string(cell.band);
+  }
+  if (cell.has_earfcn) json.format(",\"earfcn\":%lu", (unsigned long)cell.earfcn);
+  if (cell.has_rx_dbm) json.format(",\"rxDbm\":%d", cell.rx_dbm);
+  if (cell.has_tx_dbm) json.format(",\"txDbm\":%d", cell.tx_dbm);
+  if (cell.has_rsrp) {
+    json.raw(",\"rsrpDbm\":");
+    json.tenths(cell.rsrp_tenths_dbm);
+  }
+  if (cell.has_rsrq) {
+    json.raw(",\"rsrqDb\":");
+    json.tenths(cell.rsrq_tenths_db);
+  }
+  if (cell.has_sinr) {
+    json.raw(",\"sinrDb\":");
+    json.tenths(cell.sinr_tenths_db);
+  }
+  json.raw("}]},");
+}
+
+void append_wifi(JsonWriter &json) {
+  const uint32_t now = millis();
+  json.raw("\"wifi\":{\"accessPoints\":[");
+  for (uint8_t i = 0; i < g_wifi.count; ++i) {
+    const stepwhere::WifiAccessPoint &point = g_wifi.points[i];
+    json.format("%s{\"macAddress\":\"%s\",\"signalStrengthDbm\":%d,\"channel\":%u,\"ageMs\":%lu}",
+                i ? "," : "", point.mac, point.rssi, point.channel,
+                (unsigned long)(now - point.observed_at_ms));
+  }
+  json.raw("]},");
+}
+
+/** Builds the ingest JSON into g_payload; returns its length, or 0 on overflow. */
+size_t build_payload(bool gps_fix, bool include_cell, bool include_wifi) {
+  JsonWriter json = { g_payload, sizeof(g_payload), 0, false };
+  g_payload[0] = '\0';
 
   int battery_mv = 1;
-  if (g_vdd_mon.bat_volt > 0.0f) {
-    battery_mv = (int)(g_vdd_mon.bat_volt * 1000.0f + 0.5f);
+  if (g_power.bat_volt > 0.0f) {
+    battery_mv = (int)(g_power.bat_volt * 1000.0f + 0.5f);
     if (battery_mv < 1) battery_mv = 1;
   }
 
-  int satellite_count = g_loc.num_satellite;
-  if (satellite_count < 0) satellite_count = 0;
-
-  String body;
-  body.reserve(320);
-  body += "{";
-  body += "\"hardwareIdentifier\":\"";
-  body += json_escape(hardware_id);
-  body += "\",";
-  body += "\"latitude\":";
-  body += String(lat, 8);
-  body += ",";
-  body += "\"longitude\":";
-  body += String(lon, 8);
-  body += ",";
-  body += "\"accuracyMeters\":null,";
-  body += "\"batteryPercent\":";
-  body += String(battery_percent);
-  body += ",";
-  body += "\"batteryVoltageMv\":";
-  body += String(battery_mv);
-  body += ",";
-  body += "\"signalStrength\":0,";
-  body += "\"satelliteCount\":";
-  body += String(satellite_count);
-  body += ",";
-  body += "\"stepCounter\":";
-  body += String(g_steps.steps_total);
-  body += ",";
-  body += "\"deviceState\":\"";
-  body += dev_status;
-  body += "\"";
-  body += "}";
-  return body;
-}
-
-
-
-// =============================================================================
-//  ADC HELPERS
-// =============================================================================
-
-/**
- * Read PA6 (ADC_IN6) and return the raw 12-bit value (0–4095).
- * Call adc_init() once in setup() before using these.
- */
-uint16_t adc_read_battery_raw() {
-  return (uint16_t)analogRead(ADC_PIN);
-}
-
-/**
- * Read PA6 and convert to millivolts using the supply voltage as reference.
- */
-float adc_read_battery_mv() {
-  uint16_t raw = adc_read_battery_raw();
-  return (raw / 4095.0f) * VREF_MV;
-}
-
-/**
- * Read the internal VREF channel.
- * On STM32G071 the internal reference is nominally 1212 mV (typ).
- * Reading it lets you back-calculate the actual VDDA when it drifts.
- *
- * Actual VDDA (mV) = 1212 * 4095 / vref_raw
- */
-uint16_t adc_read_vref_raw() {
-  return (uint16_t)analogRead(ADC_VREF_CH);
-}
-
-float adc_actual_vdda_mv() {
-  uint16_t vref_raw = adc_read_vref_raw();
-  if (vref_raw == 0) return 0.0f;
-  return (1212.0f * 4095.0f) / (float)vref_raw;
-}
-
-/**
- * Read PA6 in mV, corrected using the actual VDDA measured via Vref channel.
- * More accurate than assuming a fixed 3.3 V rail.
- */
-float adc_read_battery_mv_calibrated() {
-  float vdda_mv = adc_actual_vdda_mv();
-  uint16_t raw = adc_read_battery_raw();
-  return (raw / 4095.0f) * vdda_mv;
-}
-
-/**
- * Call once in setup() — sets resolution and pins to analog input mode.
- */
-void adc_init() {
-  analogReadResolution(ADC_RESOLUTION);
-  pinMode(ADC_PIN, INPUT_ANALOG);
-  DEBUG.println("[ADC] Initialised — PA6 + Vref channel ready.");
-}
-
-/**
- * Print a full ADC snapshot to the debug console.
- */
-void adc_print() {
-  uint16_t pa6_raw = adc_read_battery_raw();
-  uint16_t vref_raw = adc_read_vref_raw();
-  float vdda_mv = adc_actual_vdda_mv();
-  float pa6_mv = (pa6_raw / 4095.0f) * vdda_mv;
-  g_vdd_mon.bat_volt = pa6_mv / 1000;
-  g_vdd_mon.vdd_volt = vdda_mv / 1000;
-
-  g_vdd_mon.bat_volt = g_vdd_mon.bat_volt * 2.0;
-
-  DEBUG.println("[ADC] ---- ADC Snapshot ----");
-  DEBUG.print("[ADC] vBAT  raw  : ");
-  DEBUG.println(pa6_raw);
-  DEBUG.print("[ADC] vBAT  V   : ");
-  DEBUG.println(g_vdd_mon.bat_volt, 2);
-  DEBUG.print("[ADC] Vref raw  : ");
-  DEBUG.println(vref_raw);
-  DEBUG.print("[ADC] VDDA V   : ");
-  DEBUG.println(g_vdd_mon.vdd_volt, 2);
-  DEBUG.println("[ADC] --------------------");
-
-  if (g_vdd_mon.bat_volt > MIN_BAT_VOLT) {
-    g_vdd_mon.battery_level = (g_vdd_mon.bat_volt - MIN_BAT_VOLT) * BAT_RATIO;
-    if (g_vdd_mon.battery_level > 100) g_vdd_mon.battery_level = 100;
-    if (g_vdd_mon.battery_level < 0) g_vdd_mon.battery_level = 0;
-  } else g_vdd_mon.battery_level = 0;
-}
-
-// ─── Forward declarations (location / sleep) ──────────────────────────────────
-void enter_sleep();
-void location_timer_tick();
-
-
-// =============================================================================
-//  SLEEP  — LDO off (cuts GSM + GPS) + STM32 RTC deep sleep
-// =============================================================================
-
-/**
- * Full system sleep:
- *   1. Graceful GSM power off (AT+CFUN=0)
- *   2. LDO cut — GSM + GPS lose power
- *   3. STM32 enters deep-sleep; RTC wakes it after SLEEP_DURATION_S seconds
- *   4. On wake: re-init serial ports, power on GSM, ready-loop takes over
- */
-void enter_sleep() {
-#if 0
-    DEBUG.print("[SLEEP] Entering deep sleep for ");
-    DEBUG.print(SLEEP_DURATION_S);
-    DEBUG.println(" s ...");
-    delay(50);   // let UART TX flush
-
-    gsm_power_off();   // AT+CFUN=0 then LDO off
-
-    // Reset flags — everything must reinitialise after wake
-    g_status.powered_on     = false;
-    g_status.gprs_connected = false;
-    g_loc.has_fix           = false;
-    g_loc.is_stationary     = false;
-
-    // STM32 RTC-based deep sleep
-    LowPower.deepSleep(SLEEP_DURATION_S * 1000);
-
-    // ── Resumes here after RTC wakeup ─────────────────────────────────────────
-    SerialDBG.begin(DBG_BAUD);
-    SerialGSM.begin(GSM_BAUD);
-    SerialGPS.begin(GPS_BAUD);
-    delay(200);
-    DEBUG.println("\r\n[SLEEP] Woke from RTC sleep — reinitialising ...");
-
-    gsm_power_on();   // LDO on + PWRKEY pulse; ready-loop in loop() handles rest
-#endif
+  json.raw("{\"hardwareIdentifier\":");
+  json.string(g_modem.imei);
+  json.raw(",\"latitude\":");
+  json.coordinate(gps_fix ? g_gps.lat : 0.0);
+  json.raw(",\"longitude\":");
+  json.coordinate(gps_fix ? g_gps.lon : 0.0);
+  json.raw(gps_fix ? ",\"gpsFixValid\":true," : ",\"gpsFixValid\":false,");
+  if (include_cell) append_cellular(json);
+  if (include_wifi) append_wifi(json);
+  json.format("\"accuracyMeters\":null,\"batteryPercent\":%d,\"batteryVoltageMv\":%d,\"signalStrength\":0",
+              g_power.battery_level, battery_mv);
+  json.format(",\"satelliteCount\":%u,\"stepCounter\":%lu,\"deviceState\":\"%s\"}",
+              gps_fix ? g_gps.sats : 0, (unsigned long)g_steps.steps_total,
+              g_steps.sleep_mode_on ? "sleep" : "active");
+  return json.overflow ? 0 : json.length;
 }
 
 // =============================================================================
-//  LOCATION TIMER TICK  — call once per main loop iteration
+//  HTTP UPLOAD
 // =============================================================================
 
-/**
- * Every CHECK_INTERVAL_MS (1 min):
- *   - Compare current GPS position against last stored reference.
- *   - Moved >= MOVE_THRESHOLD_M  → update reference, reset stationary timer.
- *   - Moved <  MOVE_THRESHOLD_M  → accumulate stationary time;
- *                                   if >= STATIONARY_LIMIT_MS → enter_sleep().
- */
-void location_timer_tick() {
-  unsigned long now = millis();
-  if (now - g_loc.last_check_ms < CHECK_INTERVAL_MS) return;
-  g_loc.last_check_ms = now;
+// Status of the last "HTTP/1.x NNN" line (skipping interim 1xx responses), or
+// 201 for the bare " 201 " v1.2 accepted; 0 when no status was received.
+int http_status_code(const String &response) {
+  int code = 0;
+  for (int index = response.indexOf("HTTP/1."); index >= 0; index = response.indexOf("HTTP/1.", index + 1)) {
+    const int space = response.indexOf(' ', index);
+    if (space < 0) break;
+    const int parsed = response.substring(space + 1, space + 4).toInt();
+    if (parsed >= 200 && parsed <= 599) code = parsed;
+  }
+  if (code == 0 && response.indexOf(" 201 ") != -1) code = 201;
+  return code;
+}
 
-  if (!gps.location.isValid()) {
-    DEBUG.println("[TIMER] No valid GPS fix — skipping location check.");
+HttpResult http_post_json(const char *payload, size_t length, int &status_code) {
+  status_code = 0;
+  char cmd[48];
+  HttpResult result = HTTP_TRANSPORT_FAILED;
+
+  if (!gsm_send_at(SERVER_CMD, "OK", AT_TIMEOUT)) {
+    mark_data_activity();
+    return result;
+  }
+  snprintf(cmd, sizeof(cmd), "AT+HTTPPARA=port,%d", HTTP_PORT);
+  if (!gsm_send_at(cmd, "OK", AT_TIMEOUT)) {
+    mark_data_activity();
+    return result;
+  }
+  if (!gsm_send_at("AT+HTTPSETUP", "OK", AT_LONG_TIMEOUT)) {
+    gsm_send_at("AT+HTTPCLOSE", "OK", AT_TIMEOUT);
+    mark_data_activity();
+    return result;
+  }
+  snprintf(cmd, sizeof(cmd), "AT+HTTPACTION=2,%u,2", (unsigned)length);
+  if (!gsm_send_at(cmd, ">", AT_LONG_TIMEOUT)) {
+    gsm_send_at("AT+HTTPCLOSE", "OK", AT_TIMEOUT);
+    mark_data_activity();
+    return result;
+  }
+
+  SerialGSM.print(payload);
+
+  String response;
+  if (gsm_send_at("", "+HTTPRECV:", HTTP_TIMEOUT, &response)) {
+    const uint32_t started = millis();
+    while (millis() - started < 5000) {
+      while (SerialGSM.available()) response += (char)SerialGSM.read();
+      if (response.indexOf("+HTTPCLOSED:") != -1) break;
+      service_background();
+    }
+    status_code = http_status_code(response);
+    if (status_code == 201) result = HTTP_ACCEPTED;
+    else if (status_code != 0) result = HTTP_REJECTED;
+    DEBUG.print("[HTTP] Response: ");
+    DEBUG.println(response);
+  }
+  gsm_send_at("AT+HTTPCLOSE", "OK", AT_TIMEOUT);
+  mark_data_activity();
+  return result;
+}
+
+void upload_cycle() {
+  const bool sleep_upload = g_steps.sleep_mode_on && g_steps.send_sleep_data;
+
+  // 1. GPS: a fresh fix needs no network observations.
+  // 2. Wi-Fi: no fix, so scan (rate-limited) and use it with >= 2 usable APs.
+  //    The serving cell is attached too: when the Wi-Fi lookup finds nothing
+  //    the server's geolocation falls back to the cell in the same request.
+  // 3. GSM: no fix and no usable Wi-Fi, so the serving cell alone.
+  g_cell.valid = false;
+  if (!g_gps.fix) {
+    if (!refresh_wifi_observation()) return;  // the modem is being recovered
+    query_serving_cell();
+  }
+  // Re-read after the scan: a fix may have arrived during the wait.
+  const bool gps_fix = g_gps.fix;
+  const bool include_wifi = !gps_fix && wifi_observation_usable();
+  const bool include_cell = !gps_fix && g_cell.valid;
+  const LocationSource source = gps_fix ? LOCATION_GPS
+    : include_wifi ? LOCATION_WIFI
+    : include_cell ? LOCATION_GSM
+    : LOCATION_NONE;
+
+  const size_t length = build_payload(gps_fix, include_cell, include_wifi);
+  if (length == 0) {
+    ERR.println("[HTTP] Payload did not fit its buffer; upload skipped.");
     return;
   }
 
-  double cur_lat = gps.location.lat();
-  double cur_lon = gps.location.lng();
+  INFO.print("[UPLOAD] source=");
+  INFO.print(location_source_name(source));
+  if (gps_fix) {
+    INFO.print(" ");
+    INFO.print(g_gps.lat, 6);
+    INFO.print(",");
+    INFO.print(g_gps.lon, 6);
+    INFO.print(" sats=");
+    INFO.print(g_gps.sats);
+  } else {
+    INFO.print(" wifiAps=");
+    INFO.print(include_wifi ? g_wifi.count : 0);
+    INFO.print(" cell=");
+    INFO.print(include_cell ? "yes" : "no");
+  }
+  INFO.print(" steps=");
+  INFO.print(g_steps.steps_total);
+  INFO.print(" state=");
+  INFO.print(g_steps.sleep_mode_on ? "sleep" : "active");
+  INFO.print(" bytes=");
+  INFO.println(length);
+  DEBUG.println(g_payload);
 
-  if (!g_loc.has_fix) {
-    DEBUG.println("[TIMER] First GPS fix stored.");
-    g_loc.update_reference(cur_lat, cur_lon);
+  const uint32_t started = millis();
+  int status_code = 0;
+  HttpResult result = http_post_json(g_payload, length, status_code);
+  if (result == HTTP_REJECTED && (status_code == 400 || status_code == 422) && (include_cell || include_wifi)) {
+    WARN.print("[HTTP] Server returned ");
+    WARN.print(status_code);
+    WARN.println(" — resending without network observations.");
+    const size_t minimal = build_payload(gps_fix, false, false);
+    if (minimal) result = http_post_json(g_payload, minimal, status_code);
+  }
+  const uint32_t elapsed = millis() - started;
+
+  if (result == HTTP_TRANSPORT_FAILED) {
+    WARN.print("[HTTP] Upload failed (no server response) after ");
+    WARN.print(elapsed);
+    WARN.println(" ms.");
+    modem_check_transport();
     return;
   }
-
-  // TinyGPSPlus::distanceBetween() uses Haversine and returns metres
-  double dist = TinyGPSPlus::distanceBetween(
-    g_loc.last_lat, g_loc.last_lon,
-    cur_lat, cur_lon);
-  DEBUG.print("[TIMER] Distance from last point: ");
-  DEBUG.print(dist, 1);
-  DEBUG.println(" m");
-
-  if (dist >= MOVE_THRESHOLD_M) {
-    DEBUG.println("[TIMER] Movement detected — resetting stationary timer.");
-    g_loc.update_reference(cur_lat, cur_lon);
-  } else {
-    if (!g_loc.is_stationary) {
-      g_loc.is_stationary = true;
-      g_loc.stationary_since = now;
-      DEBUG.println("[TIMER] Device stationary — started stationary timer.");
-    }
-    unsigned long stat_ms = now - g_loc.stationary_since;
-    DEBUG.print("[TIMER] Stationary for ");
-    DEBUG.print(stat_ms / 1000UL);
-    DEBUG.println(" s");
+  g_modem.transport_failures = 0;
+  g_modem.stuck_link_checks = 0;
+  if (result == HTTP_REJECTED) {
+    WARN.print("[HTTP] Server returned ");
+    WARN.println(status_code);
+    return;
   }
+  INFO.print("[HTTP] 201 in ");
+  INFO.print(elapsed);
+  INFO.println(" ms.");
+  if (sleep_upload && g_steps.sleep_mode_on) g_steps.send_sleep_data = false;
 }
 
 // =============================================================================
-//  STM32 HARDWARE TIMER — fires every STEP_TIMER_INTERVAL_MS (1 minute)
-//  Calculates steps/min, resets ISR counter, checks inactivity → sleep
+//  GPS RECOVERY
 // =============================================================================
 
-HardwareTimer *step_timer = nullptr;
-
-// Minute timer callback — mirrors TimerMin() from your original code.
-// Atomic snapshot of step_isr_count (noInterrupts guards the 32-bit read on Cortex-M0+).
-void oneminute_timer_callback() {
-  noInterrupts();
-  uint32_t cnt = g_steps.step_isr_count;
-  g_steps.step_isr_count = 0;
-  wake_count = 0;
-  interrupts();
-
-  // ── Steps per minute ──────────────────────────────────────────────────────
-  g_steps.steps_this_min = cnt;
-  g_steps.steps_total += cnt;
-  g_steps.previous_steps = g_steps.steps_total;  // save baseline for next window
-
-  g_steps.minute_counter++;
-  if (g_steps.minute_counter > 10000) g_steps.minute_counter = 0;
-
-  // ── Debug heartbeat (matches your TimerMin console output) ────────────────
-  INFO.println("+------------------------------+");
-  INFO.print("| Minute counter: ");
-  INFO.println(g_steps.minute_counter);
-  INFO.println("+------------------------------+");
-
-  INFO.print("GSM Status: ");
-  DEBUG.println(g_status.gprs_connected ? "Connected" : "Disconnected");
-  INFO.print("GPS Status: ");
-  DEBUG.println(gps.location.isValid() ? "Valid fix" : "No fix");
-
-  INFO.println("+------------------------------+");
-  INFO.print("Steps in last minute: ");
-  INFO.println(g_steps.steps_this_min);
-  INFO.println("+------------------------------+");
-
-  // // ── Inactivity → flag sleep (loop() calls enter_sleep() safely) ───────────
-  // if (cnt == 0 && g_steps.is_inactive()) {
-  //     DEBUG.println("[TIMER] Idle time-out — flagging sleep mode.");
-  //     g_steps.sleep_mode_on = true;
-  // }
-
-  if (!g_steps.sleep_mode_on) {
-    g_steps.sleep_minute_count++;
-    DEBUG.print("[TIMER] Idle time: minute ");
-    DEBUG.print(g_steps.sleep_minute_count);
-    DEBUG.print("/");
-    DEBUG.println(IDLE_TIME);
-    if (g_steps.sleep_minute_count >= IDLE_TIME) {
-      // Time to evaluate
-      bool no_steps = (cnt == 0);
-      // Compare current position against position stored at sleep entry
-      double dist = 0.0;
-      bool has_gps = g_status.is_gps_ready;
-      if (has_gps) {
-        dist = TinyGPSPlus::distanceBetween(
-          g_steps.sleep_ref_lat, g_steps.sleep_ref_lon,
-          g_loc.current_lat, g_loc.current_lon);
-      }
-      bool no_movement = !has_gps || (dist < WAKE_MIN_DISTANCE_M);
-      DEBUG.print("[TIMER] — in last minute steps: ");
-      DEBUG.print(cnt);
-      DEBUG.print("  dist from sleep pos: ");
-      DEBUG.print(dist, 1);
-      DEBUG.println(" m");
-      if (no_movement && no_steps) {
-        // Neither steps nor meaningful GPS movement since last sleep — sleep again
-        DEBUG.println("[TIMER]  flagging sleep.");
-        g_steps.sleep_mode_on = true;
-        g_steps.send_sleep_data = true;
-        g_steps.sleep_minute_count = 0;
-        g_steps.start_safe_shut_down = true;
-        g_steps.sleep_ref_lat = g_loc.current_lat;
-        g_steps.sleep_ref_lon = g_loc.current_lon;
-        wake_count = 0;
-
-      } else {
-        DEBUG.println("[TIMER] activity detected — updating ref, resetting window.");
-        if (has_gps) {
-          // Update sleep ref so next window measures from here
-          g_steps.sleep_ref_lat = g_loc.current_lat;
-          g_steps.sleep_ref_lon = g_loc.current_lon;
-        }
-      }
-    }
-  }
+/** A G7A that has stopped sending NMEA entirely is restarted with the rail. */
+void check_gps_alive() {
+  if (!g_modem.rail_on || !g_gps.uart_on) return;
+  if (millis() - g_gps.last_char_at < GPS_SILENT_RESTART_MS) return;
+  if (g_gps.restart_attempted && millis() - g_gps.restart_at < GPS_SILENT_RESTART_HOLDOFF_MS) return;
+  g_gps.restart_attempted = true;
+  g_gps.restart_at = millis();
+  modem_rail_cycle("GPS sent no data for 2 minutes");
 }
 
-void oneminute_timer_init() {
-  // TIM16 is a free 16-bit timer on STM32G071; HardwareTimer picks a free one automatically
-  step_timer = new HardwareTimer(TIM16);
-  step_timer->setOverflow(STEP_TIMER_INTERVAL_MS * 1000UL, MICROSEC_FORMAT);
-  step_timer->attachInterrupt(oneminute_timer_callback);
-  step_timer->resume();
-  DEBUG.println("[TIMER] one minute timer started (1 min interval).");
-}
-
-bool step_ready = false;
-byte checkLIS2DS12() {
-  byte error;
-  dev_i2c.beginTransmission(LIS2DS12_ADDRESS);
-  error = dev_i2c.endTransmission();
-  if (error == 0) {
-    DEBUG.println("LIS2DS12 found at 0x1D");
-    step_ready = true;
-  } else {
-    DEBUG.println("LIS2DS12 not found !!!");
-    step_ready = false;
-  }
-  return error;
-}
-
-void configureLIS2DS12() {
-  // Initialize the LIS2DS12 accelerometer
-  writeRegister(LIS2DS12_REG_CTRL1, 0x60);  // Enable accelerometer, 14Bits, 400Hz output data, +/-2g full scale
-  writeRegister(LIS2DS12_FUNC_CTRL, 0x01);  // Enable Bit1(significant motion)|Bit0(Step counter)
-  writeRegister(LIS2DS12_REG_CTRL2, 0x00);
-  writeRegister(LIS2DS12_REG_CTRL3, 0x38);  // Enable tap detection on X, Y, Z axis
-  writeRegister(LIS2DS12_REG_CTRL4, 0x08);  // Double-tap interrupt driven to INT1 pin
-  writeRegister(LIS2DS12_REG_CTRL5, 0x0C);  // Significant motion interrupt driven to INT2 pin
-
-  writeRegister(LIS2DS12_TAP_6D_THS, 0x0C);   // Set tap threshold
-  writeRegister(LIS2DS12_REG_INT_DUR, 0x7F);  // Set duration, quiet and shock time windows
-  writeRegister(LIS2DS12_WAKE_UP_THS, 0x80);  //Single & double-tap enabled (SINGLE_DOUBLE_TAP = 1)
-
-  // Enable click/double-click detection (optional)
-  //writeRegister(0x38, 0x40); // Enable interrupt generation on click or double click
-  //writeRegister(0x39, 0x0A); // Set threshold for click detection
-}
-
-void writeRegister(byte reg, byte value) {
-  dev_i2c.beginTransmission(LIS2DS12_ADDRESS);
-  dev_i2c.write(reg);
-  dev_i2c.write(value);
-  dev_i2c.endTransmission();
-}
-
-void readAccelerometerData(int16_t &x, int16_t &y, int16_t &z) {
-  dev_i2c.beginTransmission(LIS2DS12_ADDRESS);
-  dev_i2c.write(LIS2DS12_REG_OUT_X_L | 0x80);  // Auto-increment register address
-  dev_i2c.endTransmission(false);
-  dev_i2c.requestFrom(LIS2DS12_ADDRESS, 6);
-  //while (dev_i2c.available() < 6);
-  x = dev_i2c.read() | (dev_i2c.read() << 8);
-  y = dev_i2c.read() | (dev_i2c.read() << 8);
-  z = dev_i2c.read() | (dev_i2c.read() << 8);
-  //* 0.061 for 2G
-}
-
-void LIS2DS12_INT1_ISR() {
-  //DEBUG.println("Double Tap Detected");
-}
-
-// isr_step_detected
-// volatile uint32_t wake_count = 0;
-void LIS2DS12_INT2_ISR() {
-  // DEBUG.println("Step Detected");
-  g_steps.step_isr_count++;
-  wake_count++;
-  if (g_steps.sleep_mode_on && wake_count >= MIN_STEPS) {
-    g_steps.sleep_mode_on = false;
-    g_steps.send_sleep_data = false;
-    g_steps.last_active_ms = millis();
-    g_steps.sleep_minute_count = 0;
-    wake_count = 0;
-    // loop() sees sleep_mode_on = false and skips enter_sleep()
-  }
-  g_steps.last_active_ms = millis();
-  g_steps.active = true;
-}
-
-void lis2ds_init() {
-  pinMode(LIS2DS12_SA0, OUTPUT);
-  pinMode(LIS2DS12_INT1, INPUT_PULLUP);
-  pinMode(LIS2DS12_INT2, INPUT_PULLUP);
-  digitalWrite(LIS2DS12_SA0, HIGH);  //0x1D
-
-  dev_i2c.begin();
-  configureLIS2DS12();
-  checkLIS2DS12();
-
-  attachInterrupt(digitalPinToInterrupt(LIS2DS12_INT1), LIS2DS12_INT1_ISR, FALLING);
-  attachInterrupt(digitalPinToInterrupt(LIS2DS12_INT2), LIS2DS12_INT2_ISR, FALLING);
-}
-
-//=============================================================================
-
-ChargeStatus getChargeStatusRaw() {
-  bool chrg = digitalRead(CHRG_PIN);
-  bool stdby = digitalRead(STDBY_PIN);
-
-  /*
-     * TP4056 outputs are open-drain and active LOW.
-     *
-     * CHRG  = LOW  -> charging
-     * STDBY = LOW  -> charging complete
-     *
-     * HIGH means high impedance, provided the pull-up is present.
-     */
-
-  if (chrg == LOW && stdby == HIGH) {
-    return CHARGE_CHARGING;
-  }
-
-  if (chrg == HIGH && stdby == LOW) {
-    return CHARGE_COMPLETE;
-  }
-
-  if (chrg == HIGH && stdby == HIGH) {
-    return CHARGE_IDLE;
-  }
-
-  return CHARGE_ERROR;
-}
-
-ChargeStatus getChargeStatus() {
-  static ChargeStatus lastStable = CHARGE_ERROR;
-  static ChargeStatus lastRaw = CHARGE_ERROR;
-  static unsigned long lastChangeTime = 0;
-
-  ChargeStatus raw = getChargeStatusRaw();
-
-  if (raw != lastRaw) {
-    lastRaw = raw;
-    lastChangeTime = millis();
-  }
-
-  if (millis() - lastChangeTime > 50) {  // 50ms debounce
-    lastStable = raw;
-  }
-  return lastStable;
-}
-
-void printChargeStatus() {
-  static ChargeStatus previousStatus = CHARGE_UNKNOWN;
-  ChargeStatus status = getChargeStatus();
-    // Nothing changed
-    if (status == previousStatus)
-      return;
-    previousStatus = status;
-
-
-  switch (status) {
-
-    case CHARGE_CHARGING:
-      {
-        is_charging = true;
-        DEBUG.println("[Battery] : CHARGING");
-        break;
-      }
-
-    case CHARGE_COMPLETE:
-      {
-        is_charging = false;
-        DEBUG.println("[Battery] : CHARGE COMPLETE");
-        break;
-      }
-    case CHARGE_IDLE:
-      {
-        is_charging = false;
-        DEBUG.println("[Battery] : IDLE / NO CHARGE");
-        break;
-      }
-    case CHARGE_ERROR:
-      is_charging = false;
-      DEBUG.println("[Battery] : ERROR / INVALID STATUS");
-      break;
-
-    default:
-      DEBUG.println("[Battery] : UNKNOWN");
-      break;
-  }
-}
-
-bool battery_powerProtection() {
-  float batteryVoltage = g_vdd_mon.bat_volt;
-  static bool prev_bat_low_status = false;
-  bool bat_low_status = false;
-
-  /*
-     * Battery critically low.
-     */
-  if (batteryVoltage < BATTERY_LOW_OFF) {
-    bat_low_status = true;
-  }
-  /*
-     * Battery is OK.
-     */
-  else if (batteryVoltage >= BATTERY_LOW_ON) {
-    bat_low_status = false;
-  }
-  // Nothing changed
-  DEBUG.println(bat_low_status ? "[BATTERY] : LOW " : "[BATTERY] : OK");
-  if (bat_low_status == prev_bat_low_status)
-    return bat_low_status;
-
-  if (bat_low_status)
-    ldo_enable(false);
-
-  prev_bat_low_status = bat_low_status;
-  return bat_low_status;
-}
-
-// No Charging Thing is available
-volatile bool chargeStatusChanged = false;
-
-void chargeStatusISR() {
-  chargeStatusChanged = true;
-}
-
-/*
-void BMS_ISR() {
-  if (digitalRead(CHRG_PIN) == LOW) {
-    DEBUG.println("ISR Charging On");
-    DEBUG.println("System Reboot...");
-    delay(5);
-    HAL_NVIC_SystemReset();
-  } else {
-    DEBUG.println("ISR Charging Off");
-    DEBUG.println("System Reboot...");
-    delay(5);
-    HAL_NVIC_SystemReset();
-  }
-  delay(50);
-}
-*/
-
-//=============================================================================
-
-
-// ═════════════════════════════════════════════════════════════════════════════
+// =============================================================================
 //  SETUP
-// ═════════════════════════════════════════════════════════════════════════════
+// =============================================================================
+
+void log_reset_cause(uint32_t flags) {
+  INFO.print("[BOOT] Reset cause:");
+  if (flags & RCC_CSR_PWRRSTF) INFO.print(" power-on/brownout");
+  if (flags & RCC_CSR_PINRSTF) INFO.print(" reset-pin");
+  if (flags & RCC_CSR_SFTRSTF) INFO.print(" software");
+  if (flags & RCC_CSR_IWDGRSTF) INFO.print(" independent-watchdog");
+  if (flags & RCC_CSR_WWDGRSTF) INFO.print(" window-watchdog");
+  INFO.println();
+}
 
 void setup() {
+  const uint32_t reset_flags = RCC->CSR;
+  __HAL_RCC_CLEAR_RESET_FLAGS();
+
   pinMode(GSM_PWRKEY, OUTPUT);
   digitalWrite(GSM_PWRKEY, HIGH);  // PWRKEY idle high
-
   pinMode(LDO_EN, OUTPUT);
-  digitalWrite(LDO_EN, LOW);  // LDO off initially
+  digitalWrite(LDO_EN, LOW);       // rail off until the modem sequence
 
-  // Initialise ADC
-  adc_init();
-  //========================================================================
   SerialDBG.begin(DBG_BAUD);
-  delay(200);
-  INFO.println("[SETUP]: === STM32G071CB — N706 GSM / G7A GPS Tracker ===");
-  if (gpsreset_magic == GPS_RESET_MAGIC) {
-    /*
-         * Clear immediately.
-         */
-    gpsreset_magic = 0;
-    DEBUG.println("System reset reason : GPS");
-  }
-  //========================================================================
+  delay(50);
+  INFO.println("[BOOT] Stepwhere tracker " APP_VERSION);
+  log_reset_cause(reset_flags);
+
+  analogReadResolution(BATTERY_ADC_BITS);
+  pinMode(ADC_PIN, INPUT_ANALOG);
   pinMode(CHRG_PIN, INPUT_PULLUP);
   pinMode(STDBY_PIN, INPUT_PULLUP);
-  printChargeStatus();
-  adc_print();
+  update_power();
+  INFO.print("[BOOT] Battery ");
+  INFO.print(g_power.bat_volt, 2);
+  INFO.println(" V");
 
-  //========================================================================
-  ldo_enable(true);
-  delay(500);  // LDO settle
-  SerialGSM.begin(GSM_BAUD);
-  SerialGPS.begin(GPS_BAUD);
+  restore_steps();
+  g_steps.minute_started = millis();
 
-  // Initialise RTC-based low power (required before LowPower.deepSleep)
-  // LowPower.begin();
-
-  lis2ds_init();
-  g_steps.last_active_ms = millis();
-  oneminute_timer_init();
-
-  gsm_power_on();
-  // ── Retry loop: repeat every failed step until all flags are set ──────────
-  uint8_t count = 0;
-  while (!g_status.ready() && count < 5) {
-    INFO.println("[SETUP] System not ready — running init sequence ...");
-    count++;
-    // Step 1: modem power + SIM check
-    if (!g_status.powered_on) {
-      if (modem_check()) {
-        g_status.powered_on = true;
-        INFO.println("[SETUP] Modem OK.");
-      } else {
-        DEBUG.println("[SETUP] Modem check failed — power cycling ...");
-        gsm_power_off();
-        delay(2000);
-        gsm_power_on();
-        delay(3000);
-        g_status.print();
-        continue;  // restart from top of while
-      }
-    }
-    // Step 2: IMEI
-    if (!g_status.imei_valid) {
-      g_imei = get_imei();
-      g_status.imei_valid = (g_imei.length() == 15);
-      if (!g_status.imei_valid) {
-        ERR.println("[SETUP] IMEI invalid — retrying in 3 s ...");
-        delay(3000);
-        g_status.print();
-        continue;
-      }
-      INFO.println("[SETUP] IMEI OK.");
-    }
-
-    // Step 3: GPRS
-    if (!g_status.gprs_connected) {
-      g_status.gprs_connected = gprs_on();
-      if (!g_status.gprs_connected) {
-        DEBUG.println("[SETUP] GPRS failed — retrying in 5 s ...");
-        delay(5000);
-        g_status.print();
-        continue;
-      }
-      INFO.println("[SETUP] GPRS OK.");
-    }
-  }
-  //  if(!cert_upload_ca()){
-  //     DEBUG.println("[SETUP] WARNING: CA certificate not available — HTTPS will fail.");
-  //   }else if (!https_configure_ssl()) {
-  //       DEBUG.println("[SETUP] WARNING: SSL config failed — HTTPS will fail.");
-  //   }
-
-  g_status.print();
-  INFO.println("[SETUP] Init complete.\r\n");
-  INFO.println(APP_VERSION);
+  wait_ms(2000);  // let the shared rail discharge before a fresh PWRKEY pulse
+  // Powered whatever the battery reads, as in v1.2; loop() cuts it if low.
+  modem_power_on();
+  // Accelerometer after the PWRKEY sequence, as in the wifi-experiment build.
+  accel_init();
+  modem_ensure_ready();
+  INFO.println("[BOOT] Init complete.");
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-//  LOOP  — collect GPS for 25 s, then POST
-// ═════════════════════════════════════════════════════════════════════════════
+// =============================================================================
+//  LOOP
+// =============================================================================
 
 void loop() {
-  printChargeStatus();
-  adc_print();
-  // if (is_charging && (!g_steps.send_sleep_data)) {
-  //   DEBUG.println("[BATTERY] : CHARGE ON");
-  //   delay(5000);
-  //   if (g_status.powered_on == true) {
-  //     INFO.println("[MAIN] Shutdown (GSM OFF)");
-  //     gsm_power_off();
-  //     delay(2000);
-  //     g_status.reset();
-  //   }
-  //   return;
-  // }
+  service_background();
+  update_power();
 
-  if (battery_powerProtection() && (!g_steps.send_sleep_data)) {
-    if (g_status.powered_on == true) {
-      INFO.println("[MAIN] Shutdown ldo (GSM /GPS OFF)");
-     // gsm_power_off();
-      ldo_enable(0);
-      delay(2000);
-      g_status.reset();
+  if (g_power.battery_low && !g_steps.send_sleep_data) {
+    if (g_modem.rail_on) {
+      ldo_enable(false);
+      modem_invalidate();
     }
-    delay(5000);
+    wait_ms(5000);
     return;
   }
 
-  if (!g_steps.sleep_mode_on || g_steps.send_sleep_data) {
-    // If GPRS dropped at runtime, clear the flag and re-run the ready loop
-    if (!g_status.ready()) {
-      DEBUG.println("[MAIN] System not ready — re-running init sequence ...");
-
-      if (!g_status.ready()) {
-        if (!g_status.powered_on) {
-          if (modem_check()) {
-            g_status.powered_on = true;
-
-          } else {
-            ERR.println("[MAIN] Modem lost — power cycling ...");
-            gsm_power_off();
-            delay(2000);
-            gsm_power_on();
-            delay(3000);
-            g_status.print();
-            return;
-          }
-        }
-
-        // IMEI is read once in setup() and never re-fetched at runtime
-        if (!g_status.imei_valid) {
-          g_imei = get_imei();
-          g_status.imei_valid = (g_imei.length() == 15);
-          if (!g_status.imei_valid) {
-            ERR.println("[SETUP] IMEI invalid — retrying in 3 s ...");
-            delay(3000);
-            g_status.print();
-            return;
-          }
-          INFO.println("[SETUP] IMEI OK.");
-        }
-
-        if (!g_status.gprs_connected) {
-          DEBUG.println("[MAIN] GPRS down — retrying ...");
-          g_status.gprs_connected = gprs_on();
-          if (!g_status.gprs_connected) {
-            delay(5000);
-            g_status.print();
-            return;
-          }
-        }
-      }
-      g_status.print();
-      INFO.println("[MAIN] System ready — resuming normal operation.");
-    }
-
-    gps_feed(1000);
-    gps_check_timeout();
-    print_gps_info();
-    // location_timer_tick();
-    // adc_print();
-
-    // char json[256];
-    // build_json(json, sizeof(json), g_imei);
-    // INFO.print("[MAIN] Payload: ");
-    // INFO.println(json);
-    // String http_payload = "latitude=" + String(current_lat, 8) + "&longitude=" + String(current_lng, 8) + "&device_name=" + device_id + "&location=" + String(bat_volt, 2) + "V," + String(battery_level) + "%," + String(stepCountTotal) + "," + String(num_sat);  //+ String(battery_level) + "%,"
-    // DEBUG.println(http_payload);
-
-    if (millis() - g_http_status.last_send > HTTP_REQ_DELAY) {
-      if (g_status.ready()) {
-        // current_lat = 28.61393912;
-        // current_lng = 77.20902313;
-        // String http_payload = "latitude=" + String( g_loc.current_lat, 8) + "&longitude=" + String( g_loc.current_lon, 8) + "&device_name=" + g_imei + "&location=" + String(g_vdd_mon.bat_volt, 2) + "V," + String(g_vdd_mon.battery_level) + "%," + String(g_steps.steps_total) + "," + String( g_loc.num_satellite);//+","+ String(g_steps.sleep_mode_on);// + "%,"
-        // INFO.println(http_payload);
-        // static uint8_t reconnect = 0;
-        // bool ok = http_post(http_payload.c_str());
-        // bool ok = https_post_v1(http_payload.c_str());
-        // bool ok = neoway_test(NEOWAY_DATA);
-        bool is_sleep_on = g_steps.sleep_mode_on;
-        String telemetry_payload = build_location_telemetry_json();
-        INFO.print("[MAIN] HTTP ingest JSON payload: ");
-        INFO.println(telemetry_payload);
-       
-        bool ok = http_post_json(telemetry_payload.c_str());
-        if (!ok) {
-          g_http_status.reconnect_cnt++;
-          if (g_http_status.reconnect_cnt >= 5) {
-            g_http_status.reconnect_cnt = 0;
-            DEBUG.println("[MAIN] HTTP failed — marking GPRS for reconnect.");
-            g_status.gprs_connected = false;
-          }
-        } else {
-          if(is_sleep_on){
-            if (g_steps.sleep_mode_on && g_steps.send_sleep_data)
-              g_steps.send_sleep_data = false;
-          }
-        }
-        g_http_status.last_send = millis();
-      }
-    }
-  } else {
-    if (g_steps.start_safe_shut_down && !g_steps.send_sleep_data) {
-      // ldo_enable(0);
-      INFO.println("[MAIN] Shutdown (GSM OFF)");
-      gsm_power_off();
-      delay(2000);
-      g_status.reset();
-      // g_steps.sleep_mode_on = false;
-      g_steps.send_sleep_data = false;
+  if (g_steps.sleep_mode_on && !g_steps.send_sleep_data) {
+    if (g_steps.start_safe_shut_down) {
+      INFO.println("[SLEEP] Modem radio off.");
+      modem_radio_off();
       g_steps.start_safe_shut_down = false;
     }
-    gps_feed(1000);
-    gps_check_timeout();
-    __WFI();
+    wait_ms(1000);
+    return;
   }
-  delay(1000);
+
+  check_gps_alive();
+  if (!modem_ensure_ready()) {
+    wait_ms(1000);
+    return;
+  }
+
+  if (!g_upload_attempted || millis() - g_last_upload >= HTTP_REQ_DELAY) {
+    upload_cycle();
+    // The interval starts after the upload, which also gives the radio quiet
+    // time before the next Wi-Fi scan.
+    g_last_upload = millis();
+    g_upload_attempted = true;
+  }
+  wait_ms(200);
 }
