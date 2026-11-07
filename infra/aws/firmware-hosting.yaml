@@ -1,0 +1,176 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Stepwhere OTA firmware hosting. Private S3 bucket served through CloudFront
+  (plain HTTP allowed for the N706B; images are ECDSA-signed), plus an IAM role
+  that GitHub Actions assumes via OIDC to publish releases. No long-lived keys.
+
+Parameters:
+  GitHubRepo:
+    Type: String
+    Default: Smartshoe24/Stepwhere-Firmware
+    Description: owner/repo allowed to publish firmware
+  CreateGitHubOidcProvider:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: >
+      "false" if this AWS account already has the
+      token.actions.githubusercontent.com OIDC provider.
+  CustomDomain:
+    Type: String
+    Default: ""
+    Description: Optional, e.g. fw.stepwhere.in (needs CertificateArn)
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: ACM certificate in us-east-1 covering CustomDomain
+
+Conditions:
+  MakeOidc: !Equals [!Ref CreateGitHubOidcProvider, "true"]
+  HasDomain: !And
+    - !Not [!Equals [!Ref CustomDomain, ""]]
+    - !Not [!Equals [!Ref CertificateArn, ""]]
+
+Resources:
+  FirmwareBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub stepwhere-firmware-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub stepwhere-firmware-oac-${AWS::AccountId}
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Stepwhere OTA firmware
+        PriceClass: PriceClass_200      # includes India edge locations
+        HttpVersion: http2
+        Aliases: !If [HasDomain, [!Ref CustomDomain], !Ref AWS::NoValue]
+        ViewerCertificate: !If
+          - HasDomain
+          - AcmCertificateArn: !Ref CertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: s3
+            DomainName: !GetAtt FirmwareBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: s3
+          # allow-all: devices use plain HTTP (signature protects the image),
+          # browsers and tools can still use HTTPS.
+          ViewerProtocolPolicy: allow-all
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: false               # keep byte ranges exact for resumed downloads
+          # Managed "CachingOptimized": honours Cache-Control set at upload
+          # (manifest 60 s, images immutable).
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FirmwareBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CloudFrontReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${FirmwareBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt FirmwareBucket.Arn
+              - !Sub ${FirmwareBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: MakeOidc
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  PublishRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: stepwhere-firmware-publish
+      Description: Assumed by GitHub Actions on version tags to publish firmware
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                # Only version tags (v1.2.3) of this repository can publish.
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepo}:ref:refs/tags/v*
+      Policies:
+        - PolicyName: publish-firmware
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject]
+                Resource: !Sub ${FirmwareBucket.Arn}/*
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt FirmwareBucket.Arn
+              - Effect: Allow
+                Action: cloudfront:CreateInvalidation
+                Resource: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}
+
+Outputs:
+  BucketName:
+    Value: !Ref FirmwareBucket
+  DistributionId:
+    Value: !Ref Distribution
+  CloudFrontDomain:
+    Description: Point fw.stepwhere.in (CNAME at GoDaddy) here
+    Value: !GetAtt Distribution.DomainName
+  PublishRoleArn:
+    Description: Put this in GitHub repo variable AWS_PUBLISH_ROLE_ARN
+    Value: !GetAtt PublishRole.Arn
