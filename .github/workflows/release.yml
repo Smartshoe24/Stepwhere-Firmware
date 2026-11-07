@@ -48,9 +48,12 @@ jobs:
           python3 - "$TAG" "$SRC_VER" <<'EOF'
           import sys
           sys.path.insert(0, "tools")
+          import re
           from ota_tool import parse_version, version_str
           tag, src = sys.argv[1], sys.argv[2]
-          if parse_version(tag) != parse_version(src):
+          # APP_VERSION may carry a suffix ("v2.1-lis2dh12"); the firmware reads the numbers only
+          m = re.match(r"v?\d+\.\d+(?:\.\d+)?", src)
+          if not m or parse_version(tag) != parse_version(m.group(0)):
               sys.exit(f"tag {tag} != APP_VERSION {src!r} in stepwhere/stepwhere.ino")
           print("version", version_str(parse_version(tag)))
           EOF

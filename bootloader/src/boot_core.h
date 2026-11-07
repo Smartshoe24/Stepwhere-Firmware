@@ -10,9 +10,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "ota_layout.h"
 #include "w25q.h"
 
-#define BOOT_VERSION_STR "0.2.2"
+#define BOOT_VERSION_STR "0.3.0"
+#define BOOT_VERSION_CODE OTA_VERSION(0, 3, 0)
 
 typedef struct {
     void *ctx;

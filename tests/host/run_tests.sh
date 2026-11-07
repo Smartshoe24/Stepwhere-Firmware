@@ -33,5 +33,9 @@ ${CC:-cc} $CFLAGS "$HOST/test_boot.c" "$HOST/fake_w25q.c" "$ROOT/bootloader/src/
     -o "$HOST/test_boot.out"
 "$HOST/test_boot.out" "$TMP/fw.ota"
 
+echo "== OTA client parsing"
+${CC:-cc} $CFLAGS "$HOST/test_ota_util.c" -o "$HOST/test_ota_util.out"
+"$HOST/test_ota_util.out"
+
 echo "== Packaging tool"
 "$PY" "$HOST/test_ota_tool.py"

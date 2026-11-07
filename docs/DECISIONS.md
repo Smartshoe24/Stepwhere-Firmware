@@ -32,6 +32,12 @@ made; never delete one, mark it "Replaced by D-xx" instead.
 | D-24 | 2026-10-30 | Targeted updates (planned): device first reads devices/<IMEI>.json, then manifest.json; manifest may carry "rollout": N (% of devices by IMEI hash) | Test on chosen devices and staged rollouts with static files, no backend code; signature still required | Separate firmware per group |
 | D-25 | 2026-10-30 | Fleet monitoring: a "fw" block (app, boot, key, ota, last, avail, dl) added to the EXISTING location upload; admin shows versions per device | No extra connection or battery; agreed with owner. Admin-controlled rollouts come after monitoring | Separate /device-status endpoint |
 | D-26 | 2026-10-30 | Bootloader gets a fixed info block (version, key fingerprint) the app can read | So the app can report the bootloader version and trusted key | App guessing the bootloader version |
+| D-27 | 2026-11-06 | Main firmware = v2.1-lis2dh12 (Stepwhere-Firmware); OTA added as a separate tab stepwhere/ota.ino with 6 small hooks in stepwhere.ino | Keeps the tracker code readable; later firmware changes rarely touch OTA | Rewrite into stack apps/firmware v2.0 |
+| D-28 | 2026-11-06 | Trial firmware confirms after the first upload the server accepts (201); no restart after confirm, watchdog stays fed from service_background() | 201 proves modem, data and server path work; avoids a modem power cycle. Every wait in v2.1 already goes through service_background() | Confirm on a timer; restart after confirm (as test app) |
+| D-29 | 2026-11-06 | Download over AT+HTTPACTION=99 (own GET with Range), 4 KB per request = one W25Q sector, sector erased before each write; parser accepts +HTTPRECV with or without length | Matches how v2.1 uploads; resumable; retries cannot hit non-erased flash. Exact modem framing still to be confirmed on hardware | TCP sockets (TCPSETUP failed in probe) |
+| D-30 | 2026-11-06 | Bootloader v0.3.0 exposes an info block at 0x080000C0 (version, key fingerprint, hw id) | App reports bootloader + key in the fw block (D-26) | — |
+| D-31 | 2026-11-06 | fw block omitted when a large Wi-Fi payload leaves < 220 bytes; server schema strips unknown keys so old servers accept it | An oversize payload would skip the whole upload | Always append |
+| D-32 | 2026-11-06 | Device never re-downloads a version it rolled back from (read from the download-slot header) | Avoids a download/install/rollback loop | Server-side blocklist only |
 
 ## Follow-ups noted (not OTA, tracked here so they are not lost)
 

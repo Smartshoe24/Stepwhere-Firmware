@@ -13,6 +13,10 @@ SECTIONS
 {
   .isr_vector : { KEEP(*(.isr_vector)) } > FLASH
 
+  /* Must stay at 0x080000C0 (BOOT_INFO_ADDR): the application reads it. */
+  .boot_info : { KEEP(*(.boot_info)) } > FLASH
+  ASSERT(ADDR(.boot_info) == 0x080000C0, "boot_info moved")
+
   .text :
   {
     *(.text*)

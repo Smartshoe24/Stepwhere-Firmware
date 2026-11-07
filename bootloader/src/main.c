@@ -14,6 +14,17 @@
 #include "ota_layout.h"
 #include "w25q.h"
 
+/* Read by the application at BOOT_INFO_ADDR (placed by the linker script). */
+__attribute__((section(".boot_info"), used))
+const ota_boot_info_t g_boot_info = {
+    .magic = BOOT_INFO_MAGIC,
+    .info_version = 1,
+    .boot_version = BOOT_VERSION_CODE,
+    .key_fp = { OTA_PUBLIC_KEY[0], OTA_PUBLIC_KEY[1], OTA_PUBLIC_KEY[2], OTA_PUBLIC_KEY[3] },
+    .hw_id = OTA_HW_ID_GSM_PCB_R1,
+    .reserved = { 0, 0, 0 },
+};
+
 /* ------------------------------------------------------------------------ */
 /* Time                                                                     */
 

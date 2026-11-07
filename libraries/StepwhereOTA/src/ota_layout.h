@@ -33,6 +33,20 @@ extern "C" {
 #define APP_ADDR              (BOOTLOADER_ADDR + BOOTLOADER_SIZE)   /* 0x08004000 */
 #define APP_MAX_SIZE          (MCU_FLASH_SIZE - BOOTLOADER_SIZE)    /* 112 KB     */
 
+/* Bootloader info block: fixed address right after the bootloader's vector
+ * table, so the application can report which bootloader and key it runs on. */
+#define BOOT_INFO_ADDR        (BOOTLOADER_ADDR + 0xC0UL)
+#define BOOT_INFO_MAGIC       0x49425753UL  /* "SWBI" */
+
+typedef struct {
+    uint32_t magic;           /* BOOT_INFO_MAGIC                              */
+    uint32_t info_version;    /* 1                                            */
+    uint32_t boot_version;    /* OTA_VERSION(maj, min, patch) of the bootloader */
+    uint8_t  key_fp[4];       /* first 4 bytes of the trusted public key      */
+    uint32_t hw_id;           /* OTA_HW_ID_*                                  */
+    uint32_t reserved[3];
+} ota_boot_info_t;
+
 /* ------------------------------------------------------------------------ */
 /* W25Q128 external flash (16 MB, 4 KB sectors, 64 KB blocks)               */
 /* ------------------------------------------------------------------------ */
@@ -143,9 +157,11 @@ typedef struct {
 
 /* Compile-time checks that the structs match the documented sizes. */
 #if defined(__cplusplus)
+static_assert(sizeof(ota_boot_info_t) == 32, "ota_boot_info_t must be 32 bytes");
 static_assert(sizeof(ota_image_header_t) == OTA_HDR_SIZE, "ota_image_header_t must be 256 bytes");
 static_assert(sizeof(ota_boot_meta_t) == 88, "ota_boot_meta_t must be 88 bytes");
 #elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+_Static_assert(sizeof(ota_boot_info_t) == 32, "ota_boot_info_t must be 32 bytes");
 _Static_assert(sizeof(ota_image_header_t) == OTA_HDR_SIZE, "ota_image_header_t must be 256 bytes");
 _Static_assert(sizeof(ota_boot_meta_t) == 88, "ota_boot_meta_t must be 88 bytes");
 #endif

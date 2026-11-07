@@ -37,6 +37,13 @@
 #include <stdarg.h>
 
 #include "accel_steps.h"
+// OTA (bootloader at 0x08000000, this app at 0x08004000): see ota.ino
+#include <W25QArduino.h>
+#include <ota_crc32.h>
+#include <ota_image.h>
+#include <ota_layout.h>
+#include <ota_meta.h>
+#include <ota_public_key.h>
 #include "src/radio_parsers.h"
 
 #define APP_VERSION "v2.1-lis2dh12"
@@ -337,6 +344,7 @@ void service_background() {
   service_gps();
   service_motion();
   service_minute();
+  ota_service();  // feeds the watchdog during an OTA trial boot
   running = false;
 }
 
@@ -1162,9 +1170,12 @@ size_t build_payload(bool gps_fix, bool include_cell, bool include_wifi) {
   if (include_wifi) append_wifi(json);
   json.format("\"accuracyMeters\":null,\"batteryPercent\":%d,\"batteryVoltageMv\":%d,\"signalStrength\":0",
               g_power.battery_level, battery_mv);
-  json.format(",\"satelliteCount\":%u,\"stepCounter\":%lu,\"deviceState\":\"%s\"}",
+  json.format(",\"satelliteCount\":%u,\"stepCounter\":%lu,\"deviceState\":\"%s\"",
               gps_fix ? g_gps.sats : 0, (unsigned long)g_steps.steps_total,
               g_steps.sleep_mode_on ? "sleep" : "active");
+  // Firmware/OTA status; skipped rather than overflowing a large Wi-Fi payload.
+  if (json.length + 220 < sizeof(g_payload)) ota_append_status(json);
+  json.raw("}");
   return json.overflow ? 0 : json.length;
 }
 
@@ -1310,6 +1321,7 @@ void upload_cycle() {
     WARN.println(status_code);
     return;
   }
+  ota_on_upload_accepted();
   INFO.print("[HTTP] 201 in ");
   INFO.print(elapsed);
   INFO.println(" ms.");
@@ -1357,6 +1369,7 @@ void setup() {
   delay(50);
   INFO.println("[BOOT] Stepwhere tracker " APP_VERSION);
   log_reset_cause(reset_flags);
+  ota_begin();
 
   analogReadResolution(BATTERY_ADC_BITS);
   pinMode(ADC_PIN, INPUT_ANALOG);
@@ -1418,6 +1431,8 @@ void loop() {
     // time before the next Wi-Fi scan.
     g_last_upload = millis();
     g_upload_attempted = true;
+  } else {
+    ota_tick();  // daily update check / one download chunk between uploads
   }
   wait_ms(200);
 }
