@@ -46,7 +46,10 @@
 #include <ota_public_key.h>
 #include "src/radio_parsers.h"
 
+// Overridable for OTA test builds: -DAPP_VERSION=\"v2.1.1-lis2dh12\"
+#ifndef APP_VERSION
 #define APP_VERSION "v2.1-lis2dh12"
+#endif
 
 // Modem and GPS bytes keep arriving while the background service reads the
 // accelerometer; the 64-byte default overflows. Set by build_opt.h.

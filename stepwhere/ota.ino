@@ -57,6 +57,7 @@ struct OtaClient {
 
 // Raw modem bytes for one HTTP exchange: 4 KB body + headers + URC framing.
 static uint8_t g_ota_rx[OTA_CHUNK + 1024];
+static uint8_t g_ota_rx_copy[300];   // raw start of the last reply, for the log
 
 // ----------------------------------------------------------------------------
 
@@ -213,6 +214,7 @@ static int ota_http_get(const char *path, uint32_t from, uint32_t len,
         if (got && millis() - last > 5000) break;   // quiet for 5 s
         service_background();
       }
+      memcpy(g_ota_rx_copy, g_ota_rx, got < sizeof g_ota_rx_copy ? got : sizeof g_ota_rx_copy);
       size_t plain = ota_unframe(g_ota_rx, got);
       long st = ota_find(g_ota_rx, plain, "HTTP/1.", 0);
       long hdr_end = ota_find(g_ota_rx, plain, "\r\n\r\n", 0);
@@ -228,6 +230,22 @@ static int ota_http_get(const char *path, uint32_t from, uint32_t len,
         }
         *body = g_ota_rx + b;
         *body_len = bl;
+      }
+      // Not a usable reply: show what the modem sent (first 300 bytes, escaped)
+      // so the exact +HTTPRECV framing can be seen on the TTL.
+      if (status != 200 && status != 206) {
+        INFO.print("[OTA] Raw modem reply (");
+        INFO.print((unsigned)got);
+        INFO.print(" bytes): ");
+        size_t shown = got < 300 ? got : 300;
+        for (size_t i = 0; i < shown; i++) {
+          uint8_t ch = g_ota_rx_copy[i];
+          if (ch == '\r') INFO.print("\\r");
+          else if (ch == '\n') INFO.print("\\n");
+          else if (ch >= 32 && ch < 127) INFO.write(ch);
+          else { char hx[5]; snprintf(hx, sizeof hx, "\\x%02X", ch); INFO.print(hx); }
+        }
+        INFO.println();
       }
       DEBUG.print("[OTA] GET ");
       DEBUG.print(path);
