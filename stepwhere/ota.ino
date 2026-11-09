@@ -66,6 +66,10 @@ struct OtaClient {
 static uint8_t g_ota_rx[OTA_PART + 1024];
 static uint8_t g_ota_rx_copy[200];   // raw start of the last reply, for the log
 static uint8_t g_ota_rx_tail[120];   // raw end of the last reply, for the log
+// Download probe ('p' on the debug UART): a few test GETs, raw replies logged.
+static bool g_ota_probe = false;
+static bool g_ota_dump_all = false;  // log every raw reply, not only bad ones
+static const char *g_ota_step = "";  // last AT step reached, for the probe log
 
 // ----------------------------------------------------------------------------
 
@@ -139,6 +143,9 @@ void ota_service() {
     if (c == 'o') {
       g_ota.force_check = true;
       INFO.println("[OTA] Update check requested.");
+    } else if (c == 'p') {
+      g_ota_probe = true;
+      INFO.println("[PROBE] Download probe requested (runs between uploads).");
     } else if (c == 'O') {
       char a[12];
       ota_version_str(g_ota.avail_version, a, sizeof a);
@@ -219,11 +226,14 @@ static int ota_http_get(const char *path, uint32_t from, uint32_t len,
 
   snprintf(cmd, sizeof cmd, "AT+HTTPPARA=url,\"http://" OTA_HOST "%s\"", path);
   int status = 0;
+  g_ota_step = "HTTPPARA url";
   if (gsm_send_at(cmd, "OK", AT_TIMEOUT) &&
-      gsm_send_at("AT+HTTPPARA=port,80", "OK", AT_TIMEOUT) &&
-      gsm_send_at("AT+HTTPSETUP", "OK", AT_LONG_TIMEOUT)) {
+      (g_ota_step = "HTTPPARA port", gsm_send_at("AT+HTTPPARA=port,80", "OK", AT_TIMEOUT)) &&
+      (g_ota_step = "HTTPSETUP", gsm_send_at("AT+HTTPSETUP", "OK", AT_LONG_TIMEOUT))) {
     snprintf(cmd, sizeof cmd, "AT+HTTPACTION=99,%d", n);
+    g_ota_step = "HTTPACTION prompt";
     if (gsm_send_at(cmd, ">", AT_LONG_TIMEOUT)) {
+      g_ota_step = "reply";
       SerialGSM.write((const uint8_t *)req, (size_t)n);
       size_t got = 0;
       const uint32_t started = millis();
@@ -269,7 +279,7 @@ static int ota_http_get(const char *path, uint32_t from, uint32_t len,
       // modem sent, escaped, so the +HTTPRECV framing can be seen on the TTL.
       // A plain 404 (no per-device file) is expected and not dumped.
       bool usable = (status == 200 || status == 206) && (!len || *body_len == len);
-      if (!usable && status != 404) {
+      if (g_ota_dump_all || (!usable && status != 404)) {
         INFO.print("[OTA] Raw modem reply (");
         INFO.print((unsigned)got);
         INFO.print(" bytes, body ");
@@ -452,9 +462,66 @@ static void ota_download_chunk() {
   if (g_ota.dl_offset >= g_ota.dl_size) ota_finish_download();
 }
 
+// Download probe: which replies does the N706B pass on? Text vs binary, with
+// and without Range, small vs 1 KB. Reads only; writes nothing to flash.
+static void ota_probe() {
+  struct Probe { const char *what; const char *path; uint32_t from, len; };
+  static const Probe probes[] = {
+    { "manifest, Range 0-99 (text, 206)", OTA_BASE "manifest.json", 0, 100 },
+    { "image, Range 0-99 (binary header)", OTA_BASE "releases/2.1.1/stepwhere.ota", 0, 100 },
+    { "image, Range 0-255 (whole header)", OTA_BASE "releases/2.1.1/stepwhere.ota", 0, 256 },
+    { "image, Range 0-1023 (one part)", OTA_BASE "releases/2.1.1/stepwhere.ota", 0, 1024 },
+    { "image, Range 2048-2147 (program code)", OTA_BASE "releases/2.1.1/stepwhere.ota", 2048, 100 },
+  };
+  const size_t count = sizeof probes / sizeof probes[0];
+  INFO.println("[PROBE] ---- start ----");
+  g_ota_dump_all = true;
+  for (size_t i = 0; i < count; i++) {
+    const uint8_t *body = nullptr;
+    size_t blen = 0;
+    INFO.print("[PROBE] ");
+    INFO.print((unsigned)(i + 1));
+    INFO.print("/");
+    INFO.print((unsigned)count);
+    INFO.print(" ");
+    INFO.println(probes[i].what);
+    const uint32_t t0 = millis();
+    int st = ota_http_get(probes[i].path, probes[i].from, probes[i].len, &body, &blen);
+    INFO.print("[PROBE] ");
+    INFO.print((unsigned)(i + 1));
+    INFO.print(" result: HTTP ");
+    INFO.print(st);
+    INFO.print(", body ");
+    INFO.print((unsigned)blen);
+    INFO.print("/");
+    INFO.print((unsigned)probes[i].len);
+    INFO.print(", ");
+    INFO.print(millis() - t0);
+    INFO.print(" ms, last step: ");
+    INFO.println(g_ota_step);
+    if (body && blen) {
+      INFO.print("[PROBE] first bytes: ");
+      for (size_t k = 0; k < blen && k < 16; k++) {
+        char hx[4];
+        snprintf(hx, sizeof hx, "%02X ", body[k]);
+        INFO.print(hx);
+      }
+      INFO.println();
+    }
+    wait_ms(3000);
+  }
+  g_ota_dump_all = false;
+  INFO.println("[PROBE] ---- end ----");
+}
+
 // Called from loop() when the modem is ready and no upload is due.
 void ota_tick() {
   if (!g_ota.flash_ok || !g_modem.imei[0]) return;
+  if (g_ota_probe) {
+    g_ota_probe = false;
+    ota_probe();
+    return;
+  }
   if (g_ota.trial && !g_ota.confirmed) return;   // never update an unconfirmed firmware
   if (g_ota.phase == OTA_PH_DOWNLOAD) {
     ota_download_chunk();
