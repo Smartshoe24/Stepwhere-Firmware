@@ -40,7 +40,19 @@
 // accepted upload restarts itself; each restart uses one of the bootloader's 3
 // trial boots, so a firmware that cannot reach the server rolls back on its
 // own. Time without a connection (no coverage, low battery) does not count.
+// Overridable only for the bench test builds (tests/ota_real_test/build.sh).
+#ifndef OTA_TRIAL_ONLINE_LIMIT_MS
 #define OTA_TRIAL_ONLINE_LIMIT_MS (30UL * 60UL * 1000UL)
+#endif
+// Bench test builds only, never in a release: OTA_TEST_NO_CONFIRM=1 never
+// confirms (rollback test); OTA_TEST_HANG=1 hangs at a trial boot without
+// feeding the watchdog (watchdog test).
+#ifndef OTA_TEST_NO_CONFIRM
+#define OTA_TEST_NO_CONFIRM 0
+#endif
+#ifndef OTA_TEST_HANG
+#define OTA_TEST_HANG 0
+#endif
 
 // Flash pins: SPI1 PA7/PA6/PA5, /CS PC6, /WP PC7, /HOLD PB12 (docs D-07)
 static W25QArduino g_ota_flash(PA7, PA6, PA5, PC6, PC7, PB12);
@@ -146,6 +158,16 @@ void ota_begin() {
   INFO.print(", last ");
   INFO.println(ota_result_name(g_ota.last_result));
   if (g_ota.trial) INFO.println("[OTA] Trial boot: confirming after the first accepted upload.");
+#if OTA_TEST_NO_CONFIRM
+  WARN.println("[OTA] TEST BUILD: never confirms (rollback test).");
+#endif
+#if OTA_TEST_HANG
+  if (g_ota.trial) {
+    WARN.println("[OTA] TEST BUILD: hanging now (watchdog test).");
+    SerialDBG.flush();
+    while (true) {}
+  }
+#endif
   g_ota.trial_last_ms = millis();
 }
 
@@ -156,7 +178,9 @@ static void ota_trial_deadline() {
   if (g_modem.ready()) g_ota.trial_online_ms += now - g_ota.trial_last_ms;
   g_ota.trial_last_ms = now;
   if (g_ota.trial_online_ms < OTA_TRIAL_ONLINE_LIMIT_MS) return;
-  ERR.println("[OTA] New firmware not confirmed after 30 min online - restarting (failed trial boot).");
+  ERR.print("[OTA] New firmware not confirmed after ");
+  ERR.print(OTA_TRIAL_ONLINE_LIMIT_MS / 60000UL);
+  ERR.println(" min online - restarting (failed trial boot).");
   persist_steps();
   SerialDBG.flush();
   NVIC_SystemReset();
@@ -194,6 +218,7 @@ void ota_service() {
 // Called after the server accepted an upload (HTTP 201).
 void ota_on_upload_accepted() {
   if (!g_ota.trial || g_ota.confirmed || !g_ota.flash_ok) return;
+  if (OTA_TEST_NO_CONFIRM) return;
   if (ota_meta_confirm(g_ota_flash.dev()) == W25Q_OK) {
     g_ota.confirmed = true;
     g_ota.meta_state = OTA_STATE_IDLE;
