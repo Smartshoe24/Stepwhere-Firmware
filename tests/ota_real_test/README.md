@@ -29,6 +29,13 @@ stepwhere-stack `apps/device-ingest-proxy/firmware/releases/`.
 
 After these tests the next real release must be **2.2.0 or higher**.
 
+## Starting point (cable)
+
+`prebuilt/ota_real_test/factory/stepwhere_v2.1.1_bootloader_v0.3.0.hex` is
+bootloader v0.3.0 (production key) + the published v2.1.1 app, byte for byte.
+Flash it with STM32CubeProgrammer (full chip erase first) to put the board
+back at v2.1.1 before the tests.
+
 ## Tests
 
 | # | Manifest | Do | Pass when the log shows |
