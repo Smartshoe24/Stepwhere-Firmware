@@ -4,13 +4,16 @@
 //  - At boot: open the W25Q128, read the boot metadata and the bootloader info.
 //  - Trial boot (new firmware just installed): the first upload the server
 //    accepts confirms the firmware (ota_meta_confirm). The watchdog the
-//    bootloader started is fed from service_background().
+//    bootloader started is fed from service_background(). Not confirmed after
+//    30 min with a data connection: restart (uses up one of 3 trial boots).
 //  - Once a day (and on 'o' from the debug UART): fetch
 //      /fw/devices/<IMEI>.json, else /fw/manifest.json
 //    from the ingest server. A newer, matching release is downloaded in 512 B
 //    byte ranges as hex text (?enc=hex) between uploads, checked (SHA-256 +
 //    signature), and, with
 //    enough battery, marked PENDING; the board then resets into the bootloader.
+//    A version whose image failed the check is not downloaded again until
+//    the next restart.
 //  - Every upload carries a "fw" status block.
 //
 //  Modem transport: AT+HTTPACTION=99 with our own GET request (Range header),
@@ -33,6 +36,11 @@
 #define OTA_MAX_CHUNK_FAILS 4
 #define OTA_MIN_BATTERY_V 3.70f                        // to mark an update PENDING
 #define OTA_HTTP_TIMEOUT_MS 40000UL
+// A trial firmware that has had a data connection this long without one
+// accepted upload restarts itself; each restart uses one of the bootloader's 3
+// trial boots, so a firmware that cannot reach the server rolls back on its
+// own. Time without a connection (no coverage, low battery) does not count.
+#define OTA_TRIAL_ONLINE_LIMIT_MS (30UL * 60UL * 1000UL)
 
 // Flash pins: SPI1 PA7/PA6/PA5, /CS PC6, /WP PC7, /HOLD PB12 (docs D-07)
 static W25QArduino g_ota_flash(PA7, PA6, PA5, PC6, PC7, PB12);
@@ -49,6 +57,9 @@ struct OtaClient {
   uint32_t meta_state = OTA_STATE_IDLE;
   uint32_t last_result = OTA_RES_NONE;
   uint32_t bad_version = 0;    // rolled back from this one: never take it again
+  uint32_t rejected_version = 0;  // failed the image check: skip until restart
+  uint32_t trial_online_ms = 0;   // time with a data connection while unconfirmed
+  uint32_t trial_last_ms = 0;
   uint32_t next_check_at = OTA_FIRST_CHECK_MS;
   bool force_check = false;
   OtaPhase phase = OTA_PH_IDLE;
@@ -135,11 +146,26 @@ void ota_begin() {
   INFO.print(", last ");
   INFO.println(ota_result_name(g_ota.last_result));
   if (g_ota.trial) INFO.println("[OTA] Trial boot: confirming after the first accepted upload.");
+  g_ota.trial_last_ms = millis();
 }
 
-// Called from service_background(): watchdog and debug-UART commands.
+// Unconfirmed trial firmware: restart after OTA_TRIAL_ONLINE_LIMIT_MS online.
+static void ota_trial_deadline() {
+  if (!g_ota.trial || g_ota.confirmed) return;
+  const uint32_t now = millis();
+  if (g_modem.ready()) g_ota.trial_online_ms += now - g_ota.trial_last_ms;
+  g_ota.trial_last_ms = now;
+  if (g_ota.trial_online_ms < OTA_TRIAL_ONLINE_LIMIT_MS) return;
+  ERR.println("[OTA] New firmware not confirmed after 30 min online - restarting (failed trial boot).");
+  persist_steps();
+  SerialDBG.flush();
+  NVIC_SystemReset();
+}
+
+// Called from service_background(): watchdog, trial deadline, debug-UART commands.
 void ota_service() {
   ota_wdg_kick();
+  ota_trial_deadline();
   while (SerialDBG.available()) {
     int c = SerialDBG.read();
     if (c == 'o') {
@@ -353,6 +379,7 @@ static void ota_check() {
   else if (hw != OTA_HW_ID_GSM_PCB_R1) skip = "other hardware";
   else if (ver <= g_ota.app_version) skip = "not newer";
   else if (ver == g_ota.bad_version) skip = "rolled back before";
+  else if (ver == g_ota.rejected_version) skip = "image rejected before (retried after a restart)";
   else if (size > EXT_SLOT_SIZE || size <= OTA_HDR_SIZE) skip = "bad size";
   else if (ota_crc32(g_modem.imei, strlen(g_modem.imei)) % 100u >= rollout) skip = "not in rollout";
   INFO.print("[OTA] Manifest ");
@@ -388,6 +415,9 @@ static void ota_finish_download() {
   if (st != OTA_IMG_OK || h.fw_version != g_ota.dl_version) {
     ERR.print("[OTA] Downloaded image REJECTED: ");
     ERR.println(st != OTA_IMG_OK ? ota_img_status_str(st) : "version differs from manifest");
+    // Every part was read back after writing, so the file itself is bad:
+    // downloading it again would only spend data.
+    g_ota.rejected_version = g_ota.dl_version;
     g_ota.dl_version = 0;
     g_ota.dl_size = g_ota.dl_offset = 0;
     g_ota.next_check_at = millis() + OTA_RETRY_MS;

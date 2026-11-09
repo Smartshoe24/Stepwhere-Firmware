@@ -38,6 +38,8 @@ made; never delete one, mark it "Replaced by D-xx" instead.
 | D-30 | 2026-11-06 | Bootloader v0.3.0 exposes an info block at 0x080000C0 (version, key fingerprint, hw id) | App reports bootloader + key in the fw block (D-26) | — |
 | D-31 | 2026-11-06 | fw block omitted when a large Wi-Fi payload leaves < 220 bytes; server schema strips unknown keys so old servers accept it | An oversize payload would skip the whole upload | Always append |
 | D-32 | 2026-11-06 | Device never re-downloads a version it rolled back from (read from the download-slot header) | Avoids a download/install/rollback loop | Server-side blocklist only |
+| D-33 | 2026-11-09 | Trial firmware not confirmed after 30 min with a data connection restarts itself; time without a connection does not count | Without it a firmware that runs but never gets a 201 stays unconfirmed (and blocked from updates) until someone resets the board; each restart uses one of the 3 trial boots, so it rolls back on its own. Not counting offline time keeps a good firmware from rolling back in a basement or on low battery (D-32 would then block it for good) | Plain 30 min timer (rolls back good firmware without coverage); bootloader-side timer (watchdog cannot measure uptime) |
+| D-34 | 2026-11-09 | A version whose downloaded image fails the SHA-256/signature check is skipped until the next restart | Each part is read back after writing, so a failed check means the file is bad; re-downloading every 30 min cost ~5 MB/day per device. One retry per restart still recovers from a rare one-off fault | Remember across restarts (would need a flash write); keep retrying |
 
 ## Follow-ups noted (not OTA, tracked here so they are not lost)
 
