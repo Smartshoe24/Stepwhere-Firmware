@@ -54,6 +54,24 @@ static size_t ota_unframe(uint8_t *buf, size_t len) {
   return out;
 }
 
+static int ota_hex_nibble(uint8_t c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+// Decodes 2*n hex characters from in into n bytes at out (in-place is fine:
+// out <= in). Returns false on any non-hex character.
+static bool ota_hex_decode(const uint8_t *in, size_t n, uint8_t *out) {
+  for (size_t i = 0; i < n; i++) {
+    int hi = ota_hex_nibble(in[2 * i]), lo = ota_hex_nibble(in[2 * i + 1]);
+    if (hi < 0 || lo < 0) return false;
+    out[i] = (uint8_t)(hi << 4 | lo);
+  }
+  return true;
+}
+
 // Value of "key" in a flat JSON object; copies a string or number into out.
 static bool ota_json_get(const char *json, const char *key, char *out, size_t n) {
   char pat[32];

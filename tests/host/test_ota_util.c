@@ -57,6 +57,12 @@ int main(void)
     CHECK(ota_json_get(man, "rollout", out, sizeof out) && atoi(out) == 10);
     CHECK(!ota_json_get(man, "missing", out, sizeof out));
 
+    /* Hex download (?enc=hex), decoded in place */
+    n = mk(b, "00ff10Ab7f");
+    CHECK(ota_hex_decode(b, 5, b) && b[0] == 0x00 && b[1] == 0xff && b[2] == 0x10 && b[3] == 0xab && b[4] == 0x7f);
+    n = mk(b, "0g");
+    CHECK(!ota_hex_decode(b, 1, b));
+
     printf("%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
 }

@@ -7,8 +7,9 @@
 //    bootloader started is fed from service_background().
 //  - Once a day (and on 'o' from the debug UART): fetch
 //      /fw/devices/<IMEI>.json, else /fw/manifest.json
-//    from the ingest server. A newer, matching release is downloaded in 1 KB
-//    byte ranges between uploads, checked (SHA-256 + signature), and, with
+//    from the ingest server. A newer, matching release is downloaded in 512 B
+//    byte ranges as hex text (?enc=hex) between uploads, checked (SHA-256 +
+//    signature), and, with
 //    enough battery, marked PENDING; the board then resets into the bootloader.
 //  - Every upload carries a "fw" status block.
 //
@@ -23,10 +24,11 @@
 #define OTA_CHECK_INTERVAL_MS (24UL * 60UL * 60UL * 1000UL)
 #define OTA_RETRY_MS (30UL * 60UL * 1000UL)            // after a failed check
 #define OTA_CHUNK 4096u                                // one W25Q sector
-// Bytes per HTTP request. A 1 KB reply (+ ~300 B headers/framing) arrives in
-// ~110 ms and stays close to the 1 KB UART RX buffer; 4 KB replies lost bytes
-// on the live board (2341 of 4096 received).
-#define OTA_PART 1024u
+// Image bytes per HTTP request. The image is fetched with ?enc=hex: the N706B
+// passes text replies but drops binary ones (live probe, 2026-11-09). 512
+// bytes = 1024 hex characters, + ~300 B headers/framing, close to the 1 KB
+// UART RX buffer.
+#define OTA_PART 512u
 #define OTA_PART_RETRY_MS 3000UL                       // pause after a failed part
 #define OTA_MAX_CHUNK_FAILS 4
 #define OTA_MIN_BATTERY_V 3.70f                        // to mark an update PENDING
@@ -61,9 +63,9 @@ struct OtaClient {
 
 #include "src/ota_util.h"
 
-// Raw modem bytes for one HTTP exchange: 1 KB body (or the manifest) +
-// headers + URC framing.
-static uint8_t g_ota_rx[OTA_PART + 1024];
+// Raw modem bytes for one HTTP exchange: 1 KB body (one hex part, or the
+// manifest) + headers + URC framing.
+static uint8_t g_ota_rx[2 * OTA_PART + 1024];
 static uint8_t g_ota_rx_copy[200];   // raw start of the last reply, for the log
 static uint8_t g_ota_rx_tail[120];   // raw end of the last reply, for the log
 // Download probe ('p' on the debug UART): a few test GETs, raw replies logged.
@@ -278,7 +280,8 @@ static int ota_http_get(const char *path, uint32_t from, uint32_t len,
       // body): show how the read ended and the raw start and end of what the
       // modem sent, escaped, so the +HTTPRECV framing can be seen on the TTL.
       // A plain 404 (no per-device file) is expected and not dumped.
-      bool usable = (status == 200 || status == 206) && (!len || *body_len == len);
+      const bool hex = strstr(path, "enc=hex") != nullptr;
+      bool usable = (status == 200 || status == 206) && (!len || *body_len == (hex ? 2 * len : len));
       if (g_ota_dump_all || (!usable && status != 404)) {
         INFO.print("[OTA] Raw modem reply (");
         INFO.print((unsigned)got);
@@ -429,8 +432,12 @@ static void ota_download_chunk() {
   if (g_ota.dl_offset % OTA_CHUNK == 0 && w25q_erase_sector(g_ota_flash.dev(), addr) != W25Q_OK) return;
   const uint8_t *body = nullptr;
   size_t blen = 0;
-  int st = ota_http_get(g_ota.dl_path, g_ota.dl_offset, n, &body, &blen);
-  bool got_ok = (st == 206 || (st == 200 && g_ota.dl_offset == 0 && n == g_ota.dl_size)) && blen == n;
+  char path[sizeof g_ota.dl_path + 8];
+  snprintf(path, sizeof path, "%s?enc=hex", g_ota.dl_path);
+  int st = ota_http_get(path, g_ota.dl_offset, n, &body, &blen);
+  // The body is 2*n hex characters; decode in place (body points into g_ota_rx).
+  bool got_ok = (st == 206 || (st == 200 && g_ota.dl_offset == 0 && n == g_ota.dl_size)) &&
+                blen == 2 * n && ota_hex_decode(body, n, (uint8_t *)body);
   bool ok = got_ok && w25q_write_verify(g_ota_flash.dev(), addr, body, n) == W25Q_OK;
   if (!ok) {
     WARN.print("[OTA] Part at ");
@@ -472,6 +479,7 @@ static void ota_probe() {
     { "image, Range 0-255 (whole header)", OTA_BASE "releases/2.1.1/stepwhere.ota", 0, 256 },
     { "image, Range 0-1023 (one part)", OTA_BASE "releases/2.1.1/stepwhere.ota", 0, 1024 },
     { "image, Range 2048-2147 (program code)", OTA_BASE "releases/2.1.1/stepwhere.ota", 2048, 100 },
+    { "image as hex, Range 0-511 (the download path)", OTA_BASE "releases/2.1.1/stepwhere.ota?enc=hex", 0, 512 },
   };
   const size_t count = sizeof probes / sizeof probes[0];
   INFO.println("[PROBE] ---- start ----");
