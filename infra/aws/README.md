@@ -16,7 +16,7 @@ Stack region: **ap-south-1 (Mumbai)**. CloudFront itself is global.
 3. Run:
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/Smartshoe24/Stepwhere-Firmware/ota/foundation/infra/aws/firmware-hosting.yaml
+curl -fsSLO https://raw.githubusercontent.com/Smartshoe24/Stepwhere-Firmware/fw/v2.1-ota/infra/aws/firmware-hosting.yaml
 aws cloudformation deploy --region ap-south-1 \
   --stack-name stepwhere-firmware \
   --template-file firmware-hosting.yaml \

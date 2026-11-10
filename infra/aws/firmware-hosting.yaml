@@ -146,8 +146,11 @@ Resources:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
               StringLike:
-                # Only version tags (v1.2.3) of this repository can publish.
-                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepo}:ref:refs/tags/v*
+                # Only the release job can publish. A job with "environment:"
+                # presents repo:<repo>:environment:<name> (not the tag ref);
+                # the firmware-release environment itself allows only v* tags
+                # and needs a person's approval (docs/RELEASING.md).
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepo}:environment:firmware-release
       Policies:
         - PolicyName: publish-firmware
           PolicyDocument:
