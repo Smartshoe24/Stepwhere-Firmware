@@ -46,9 +46,9 @@
 #include <ota_public_key.h>
 #include "src/radio_parsers.h"
 
-// Overridable for OTA test builds: -DAPP_VERSION=\"v2.1.1-lis2dh12\"
+// Overridable for OTA test builds: -DAPP_VERSION=\"v2.2.1-test\"
 #ifndef APP_VERSION
-#define APP_VERSION "v2.1-lis2dh12"
+#define APP_VERSION "v2.2.0-lis2dh12"
 #endif
 
 // Modem and GPS bytes keep arriving while the background service reads the

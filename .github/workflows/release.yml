@@ -57,8 +57,13 @@ jobs:
               sys.exit(f"tag {tag} != APP_VERSION {src!r} in stepwhere/stepwhere.ino")
           print("version", version_str(parse_version(tag)))
           EOF
-          if ! grep -q "ota_meta_confirm" stepwhere/stepwhere.ino; then
-            echo "::error::stepwhere.ino never calls ota_meta_confirm(); every device would roll back. Not publishing."
+          # The confirm lives in ota.ino and is reached from stepwhere.ino via
+          # ota_on_upload_accepted(); the test-only switches must be off.
+          if ! grep -q "ota_meta_confirm" stepwhere/ota.ino || \
+             ! grep -q "ota_on_upload_accepted()" stepwhere/stepwhere.ino || \
+             ! grep -q "^#define OTA_TEST_NO_CONFIRM 0" stepwhere/ota.ino || \
+             ! grep -q "^#define OTA_TEST_HANG 0" stepwhere/ota.ino; then
+            echo "::error::firmware would never confirm itself (missing confirm hook or a test switch is on); every device would roll back. Not publishing."
             exit 1
           fi
 

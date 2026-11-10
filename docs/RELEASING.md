@@ -29,7 +29,7 @@ GitHub secret. GitHub never shows it again after saving.
 
 ## Making a release
 
-1. Set `#define APP_VERSION "v1.3.0"` in `stepwhere/stepwhere.ino`, merge to main.
+1. Set `#define APP_VERSION "v1.3.0-lis2dh12"` in `stepwhere/stepwhere.ino` (the suffix is optional), merge to main.
 2. Tag the merged commit and push the tag:
    ```sh
    git tag v1.3.0
@@ -43,7 +43,7 @@ GitHub secret. GitHub never shows it again after saving.
 | Gate | Fails when |
 |---|---|
 | 1 | tag differs from `APP_VERSION` |
-| 2 | `stepwhere.ino` does not call `ota_meta_confirm()` (every device would roll back) |
+| 2 | `ota.ino` does not call `ota_meta_confirm()`, `stepwhere.ino` does not call `ota_on_upload_accepted()`, or a test switch (`OTA_TEST_NO_CONFIRM`, `OTA_TEST_HANG`) is on (every device would roll back) |
 | 3 | signed image does not verify with `tools/production_public_key.pem` (wrong secret) |
 | 4 | version is not newer than the one published |
 | 5 | nobody approves |
