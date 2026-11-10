@@ -9,6 +9,14 @@ Parameters:
     Type: String
     Default: Smartshoe24/Stepwhere-Firmware
     Description: owner/repo allowed to publish firmware
+  GitHubRepoImmutable:
+    Type: String
+    # GET repos/<owner>/<repo>/actions/oidc/customization/sub -> sub_claim_prefix
+    Default: Smartshoe24@166411271/Stepwhere-Firmware@1437508917
+    Description: >
+      owner@id/repo@id form GitHub uses in the OIDC subject when the repo has
+      immutable subjects on (survives a rename; a new repo with the same name
+      cannot publish)
   CreateGitHubOidcProvider:
     Type: String
     AllowedValues: ["true", "false"]
@@ -150,7 +158,9 @@ Resources:
                 # presents repo:<repo>:environment:<name> (not the tag ref);
                 # the firmware-release environment itself allows only v* tags
                 # and needs a person's approval (docs/RELEASING.md).
-                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepo}:environment:firmware-release
+                token.actions.githubusercontent.com:sub:
+                  - !Sub repo:${GitHubRepoImmutable}:environment:firmware-release
+                  - !Sub repo:${GitHubRepo}:environment:firmware-release
       Policies:
         - PolicyName: publish-firmware
           PolicyDocument:
